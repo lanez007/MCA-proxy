@@ -22,6 +22,7 @@ const server = http.createServer(async (req, res) => {
     const type     = url.searchParams.get("type") || "";
     const location = url.searchParams.get("location") || "";
     const limit    = parseInt(url.searchParams.get("limit") || "10");
+    const details  = url.searchParams.get("details") !== "false";
 
     try {
       const geoData = await googleGet(
@@ -37,28 +38,40 @@ const server = http.createServer(async (req, res) => {
       );
       const places = (placesData.results || []).slice(0, limit);
 
-      const detailed = await Promise.all(places.map(async (p) => {
-        try {
-          const d = await googleGet(
-            `/maps/api/place/details/json?place_id=${p.place_id}&fields=formatted_phone_number,website,formatted_address&key=${GOOGLE_API_KEY}`
-          );
-          return {
-            businessName: p.name,
-            address: d.result?.formatted_address || p.formatted_address || "",
-            phone: d.result?.formatted_phone_number || null,
-            website: d.result?.website || null,
-            placeId: p.place_id,
-            rating: p.rating || null,
-          };
-        } catch(_) {
-          return {
-            businessName: p.name,
-            address: p.formatted_address || "",
-            phone: null, website: null,
-            placeId: p.place_id, rating: p.rating || null,
-          };
-        }
-      }));
+      let detailed;
+      if (details) {
+        detailed = await Promise.all(places.map(async (p) => {
+          try {
+            const d = await googleGet(
+              `/maps/api/place/details/json?place_id=${p.place_id}&fields=formatted_phone_number,website,formatted_address&key=${GOOGLE_API_KEY}`
+            );
+            return {
+              businessName: p.name,
+              address: d.result?.formatted_address || p.formatted_address || "",
+              phone: d.result?.formatted_phone_number || null,
+              website: d.result?.website || null,
+              placeId: p.place_id,
+              rating: p.rating || null,
+            };
+          } catch(_) {
+            return {
+              businessName: p.name,
+              address: p.formatted_address || "",
+              phone: null, website: null,
+              placeId: p.place_id, rating: p.rating || null,
+            };
+          }
+        }));
+      } else {
+        detailed = places.map(p => ({
+          businessName: p.name,
+          address: p.formatted_address || "",
+          phone: null,
+          website: null,
+          placeId: p.place_id,
+          rating: p.rating || null,
+        }));
+      }
 
       respond(res, 200, { results: detailed });
     } catch(err) {
