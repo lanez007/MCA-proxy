@@ -565,6 +565,17 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // ── ONE-TIME SETUP ENDPOINT — deletes itself after use ──────────
+  if (url.pathname === '/setup-admin-rcn2024' && req.method === 'GET') {
+    try {
+      await pool.query(
+        "UPDATE users SET is_admin = TRUE, plan = 'unlimited' WHERE email IN ('support@thercngroup.com', 'ivanrcngroup@gmail.com')"
+      );
+      respond(res, 200, { success: true, message: 'Both accounts upgraded to admin + unlimited.' });
+    } catch(e) { respond(res, 500, { error: e.message }); }
+    return;
+  }
+
   respond(res, 404, { error: "Not found" });
 });
 
