@@ -565,16 +565,6 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // ── ONE-TIME SETUP ENDPOINT — deletes itself after use ──────────
-  if (url.pathname === '/setup-admin-rcn2024' && req.method === 'GET') {
-    try {
-      await pool.query(
-        "UPDATE users SET is_admin = TRUE, plan = 'unlimited' WHERE email IN ('support@thercngroup.com', 'ivanrcngroup@gmail.com')"
-      );
-      respond(res, 200, { success: true, message: 'Both accounts upgraded to admin + unlimited.' });
-    } catch(e) { respond(res, 500, { error: e.message }); }
-    return;
-  }
 
   respond(res, 404, { error: "Not found" });
 });
@@ -641,18 +631,35 @@ async function scrapeEmail(siteUrl) {
     const urlObj = new URL(siteUrl);
     const proto = urlObj.protocol === "https:" ? https : http;
     const host = urlObj.hostname;
-    // Check homepage + /contact in parallel for speed
-    const [homeEmails, contactEmails] = await Promise.all([
+    // Check multiple pages in parallel for best coverage
+    const [homeEmails, contactEmails, aboutEmails, contact2Emails] = await Promise.all([
       fetchPageEmails(host, "/", proto),
       fetchPageEmails(host, "/contact", proto),
+      fetchPageEmails(host, "/about", proto),
+      fetchPageEmails(host, "/contact-us", proto),
     ]);
-    const all = [...homeEmails, ...contactEmails];
-    // Prefer a real business email over generic ones
-    const preferred = all.find(e =>
-      !e.startsWith("noreply") && !e.startsWith("no-reply") &&
-      !e.startsWith("admin") && !e.startsWith("support") && !e.startsWith("info")
+    const all = [...new Set([...homeEmails, ...contactEmails, ...aboutEmails, ...contact2Emails])];
+    // Filter out obvious junk
+    const clean = all.filter(e =>
+      !e.includes("example.com") && !e.includes("sentry.io") &&
+      !e.includes("wix.com") && !e.includes("wordpress") &&
+      !e.includes("schema.org") && !e.includes("@2x") &&
+      !e.endsWith(".png") && !e.endsWith(".jpg") &&
+      !e.includes("jquery") && !e.includes("bootstrap") &&
+      !e.includes("googleapis") && !e.includes("cloudflare") &&
+      !e.includes("fontawesome") && e.length < 60
     );
-    return preferred || all[0] || null;
+    // Priority: owner-sounding emails first, then generic business, then anything
+    const priority = clean.find(e =>
+      !e.startsWith("noreply") && !e.startsWith("no-reply") &&
+      !e.startsWith("info@") && !e.startsWith("admin@") &&
+      !e.startsWith("contact@") && !e.startsWith("hello@") &&
+      !e.startsWith("support@")
+    );
+    const fallback = clean.find(e =>
+      !e.startsWith("noreply") && !e.startsWith("no-reply")
+    );
+    return priority || fallback || clean[0] || null;
   } catch(_) { return null; }
 }
 
