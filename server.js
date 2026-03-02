@@ -348,10 +348,10 @@ const server = http.createServer(async (req, res) => {
       const actualCount = places.length;
       const detailed = await Promise.all(places.map(async (p) => {
         try {
-          const d = await googleGet(`/maps/api/place/details/json?place_id=${p.place_id}&fields=formatted_phone_number,website,formatted_address&key=${GOOGLE_API_KEY}`);
-          return { businessName: p.name, address: d.result?.formatted_address || p.formatted_address || "", phone: d.result?.formatted_phone_number || null, website: d.result?.website || null, placeId: p.place_id, rating: p.rating || null };
+          const d = await googleGet(`/maps/api/place/details/json?place_id=${p.place_id}&fields=formatted_phone_number,website,formatted_address,opening_hours,business_status,user_ratings_total&key=${GOOGLE_API_KEY}`);
+          return { businessName: p.name, address: d.result?.formatted_address || p.formatted_address || "", phone: d.result?.formatted_phone_number || null, website: d.result?.website || null, placeId: p.place_id, rating: p.rating || null, reviewCount: p.user_ratings_total || 0 };
         } catch(_) {
-          return { businessName: p.name, address: p.formatted_address || "", phone: null, website: null, placeId: p.place_id, rating: p.rating || null };
+          return { businessName: p.name, address: p.formatted_address || "", phone: null, website: null, placeId: p.place_id, rating: p.rating || null, reviewCount: p.user_ratings_total || 0 };
         }
       }));
       await pool.query("UPDATE users SET searches_used = searches_used + $1 WHERE id = $2", [actualCount, user.id]);
@@ -371,7 +371,7 @@ const server = http.createServer(async (req, res) => {
     const bizState    = url.searchParams.get("state") || "";
     if (!placeId) { respond(res, 400, { error: "placeId required" }); return; }
     try {
-      const d = await googleGet(`/maps/api/place/details/json?place_id=${placeId}&fields=formatted_phone_number,website,formatted_address&key=${GOOGLE_API_KEY}`);
+      const d = await googleGet(`/maps/api/place/details/json?place_id=${placeId}&fields=formatted_phone_number,website,formatted_address,opening_hours,business_status,user_ratings_total&key=${GOOGLE_API_KEY}`);
       const phone   = d.result?.formatted_phone_number || null;
       const siteUrl = d.result?.website || websiteHint || null;
       const address = d.result?.formatted_address || null;
@@ -383,7 +383,10 @@ const server = http.createServer(async (req, res) => {
         ]);
       }
       const sosUrl = buildSOSUrl(bizName, bizState);
-      respond(res, 200, { phone, website: siteUrl, address, email, sosUrl });
+      const reviewCount = d.result?.user_ratings_total || null;
+      const businessStatus = d.result?.business_status || null;
+      const hasHours = !!(d.result?.opening_hours);
+      respond(res, 200, { phone, website: siteUrl, address, email, sosUrl, reviewCount, businessStatus, hasHours });
     } catch(err) { console.error(err); respond(res, 500, { error: err.message }); }
     return;
   }
@@ -565,6 +568,26 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+
+  // ── STACKING DETECTOR — proxy CourtListener MCA search ─────────
+  if (url.pathname === "/proxy-stacking" && req.method === "GET") {
+    const decoded = verifyToken(req);
+    if (!decoded) { respond(res, 401, { error: "Unauthorized" }); return; }
+    const bizName = url.searchParams.get("name") || "";
+    if (!bizName) { respond(res, 400, { error: "name required" }); return; }
+    try {
+      const query = encodeURIComponent(`"${bizName}" "merchant cash advance"`);
+      const apiUrl = `https://www.courtlistener.com/api/rest/v3/dockets/?q=${query}&order_by=score+desc&format=json&page_size=5`;
+      const clRes = await fetchURL(apiUrl);
+      let count = 0;
+      try {
+        const parsed = JSON.parse(clRes);
+        count = parsed.count || 0;
+      } catch(_) { count = 0; }
+      respond(res, 200, { count, name: bizName });
+    } catch(e) { respond(res, 200, { count: 0, name: bizName }); }
+    return;
+  }
 
   respond(res, 404, { error: "Not found" });
 });
