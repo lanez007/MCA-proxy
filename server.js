@@ -242,8 +242,79 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // ─── ENRICH ─────────────────────────────────────────────────
+  if (url.pathname === "/enrich") {
+    const decoded = verifyToken(req);
+    if (!decoded) { respond(res, 401, { error: "Unauthorized" }); return; }
+
+    const placeId  = url.searchParams.get("placeId");
+    const website  = url.searchParams.get("website") || "";
+
+    if (!placeId) { respond(res, 400, { error: "placeId required" }); return; }
+
+    try {
+      // Fetch Google Place Details for phone + website
+      const d = await googleGet(
+        `/maps/api/place/details/json?place_id=${placeId}&fields=formatted_phone_number,website,formatted_address&key=${GOOGLE_API_KEY}`
+      );
+      const phone   = d.result?.formatted_phone_number || null;
+      const siteUrl = d.result?.website || website || null;
+      const address = d.result?.formatted_address || null;
+
+      // Try to scrape email from website
+      let email = null;
+      if (siteUrl) {
+        try {
+          email = await scrapeEmail(siteUrl);
+        } catch(_) {}
+      }
+
+      respond(res, 200, { phone, website: siteUrl, address, email });
+    } catch(err) {
+      console.error(err);
+      respond(res, 500, { error: err.message });
+    }
+    return;
+  }
+
   respond(res, 404, { error: "Not found" });
 });
+
+// Scrape email from a website's homepage or contact page
+function scrapeEmail(siteUrl) {
+  return new Promise((resolve) => {
+    try {
+      const urlObj = new URL(siteUrl);
+      const options = {
+        hostname: urlObj.hostname,
+        path: urlObj.pathname || '/',
+        method: 'GET',
+        timeout: 5000,
+        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; RCNBot/1.0)' }
+      };
+      const proto = urlObj.protocol === 'https:' ? https : require('http');
+      const req = proto.request(options, (res) => {
+        let data = '';
+        res.on('data', c => { data += c; if (data.length > 100000) res.destroy(); });
+        res.on('end', () => {
+          const emailRegex = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g;
+          const matches = data.match(emailRegex) || [];
+          // Filter out common false positives
+          const filtered = matches.filter(e =>
+            !e.includes('example') && !e.includes('sentry') &&
+            !e.includes('wix') && !e.includes('wordpress') &&
+            !e.includes('schema') && !e.endsWith('.png') &&
+            !e.endsWith('.jpg') && !e.includes('@2x')
+          );
+          resolve(filtered[0] || null);
+        });
+      });
+      req.on('error', () => resolve(null));
+      req.on('timeout', () => { req.destroy(); resolve(null); });
+      req.end();
+    } catch(_) { resolve(null); }
+  });
+}
 
 function googleGet(path) {
   return new Promise((resolve, reject) => {
