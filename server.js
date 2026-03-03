@@ -475,6 +475,30 @@ const server = http.createServer(async (req, res) => {
         if (i + 5 < googlePlaces.length) await new Promise(r => setTimeout(r, 200));
       }
       const detailed = detailedRaw.slice(0, limit);
+
+      // Auto-SOS: run owner lookup in parallel for all leads with supported states
+      // Extract state from address — e.g. "123 Main St, Miami, FL 33101" → "FL"
+      const sosSupported = new Set(['FL','TX','GA','NY','CA','IL','AZ','CO','OH','PA','NC','NJ','VA','WA']);
+      await Promise.all(detailed.map(async (lead) => {
+        try {
+          const addrParts = (lead.address || '').split(',');
+          const stateRaw = addrParts[addrParts.length - 1]?.trim() || // "FL 33101" or "FL"
+                           addrParts[addrParts.length - 2]?.trim(); // fallback
+          const stateCode = (stateRaw || '').replace(/\d/g,'').trim().toUpperCase().substring(0,2);
+          if (!sosSupported.has(stateCode)) return;
+          const sosData = await Promise.race([
+            scrapeSOS(lead.businessName, stateCode),
+            new Promise(r => setTimeout(() => r(null), 4000))
+          ]);
+          if (sosData) {
+            lead.officerName      = sosData.officerName || null;
+            lead.incorporationDate = sosData.incorporationDate || null;
+            lead.businessAge      = sosData.businessAge || null;
+            lead.companyStatus    = sosData.companyStatus || null;
+          }
+        } catch(_) {}
+      }));
+
       await pool.query("UPDATE users SET searches_used = searches_used + $1 WHERE id = $2", [actualCount, user.id]);
       const newUsed = user.searches_used + actualCount;
       respond(res, 200, { results: detailed, searches_used: newUsed, searches_remaining: planLimit === Infinity ? null : planLimit - newUsed, limit: planLimit === Infinity ? null : planLimit });
@@ -492,7 +516,8 @@ const server = http.createServer(async (req, res) => {
     const bizState    = url.searchParams.get("state") || "";
     if (!placeId) { respond(res, 400, { error: "placeId required" }); return; }
     try {
-      // HERE leads have 'here_' prefix — skip Google Details call for them
+      console.log(`[ENRICH] "${bizName}" | state=${bizState} | placeId=${placeId.substring(0,20)} | websiteHint=${websiteHint ? 'yes' : 'no'}`);
+      // HERE leads have 'here_' prefix — skip Google Details, use text search instead
       let phone = null, siteUrl = websiteHint || null, address = null, reviewCount = null, businessStatus = null, hasHours = false;
       if (!placeId.startsWith('here_')) {
         const d = await googleGet(`/maps/api/place/details/json?place_id=${placeId}&fields=formatted_phone_number,website,formatted_address,opening_hours,business_status,user_ratings_total&key=${GOOGLE_API_KEY}`);
@@ -502,6 +527,22 @@ const server = http.createServer(async (req, res) => {
         reviewCount    = d.result?.user_ratings_total || null;
         businessStatus = d.result?.business_status || null;
         hasHours       = !!(d.result?.opening_hours);
+        console.log(`[ENRICH] Google Details → phone=${phone ? 'YES' : 'NO'} | website=${siteUrl ? 'YES' : 'NO'}`);
+      } else if (bizName) {
+        // HERE lead — use text search to find Google place and get details
+        try {
+          const searchData = await googleGet(`/maps/api/place/textsearch/json?query=${encodeURIComponent(bizName)}&key=${GOOGLE_API_KEY}`);
+          const gPlace = searchData.results?.[0];
+          if (gPlace?.place_id) {
+            const d = await googleGet(`/maps/api/place/details/json?place_id=${gPlace.place_id}&fields=formatted_phone_number,website,formatted_address,opening_hours,business_status,user_ratings_total&key=${GOOGLE_API_KEY}`);
+            phone   = d.result?.formatted_phone_number || null;
+            siteUrl = d.result?.website || websiteHint || null;
+            address = d.result?.formatted_address || null;
+            reviewCount    = d.result?.user_ratings_total || null;
+            businessStatus = d.result?.business_status || null;
+            hasHours       = !!(d.result?.opening_hours);
+          }
+        } catch(_) {}
       }
       const sosUrl = buildSOSUrl(bizName, bizState);
 
@@ -516,6 +557,7 @@ const server = http.createServer(async (req, res) => {
         ]),
       ]);
 
+      console.log(`[ENRICH] Result → phone=${phone ? 'YES' : 'NO'} | site=${siteUrl ? 'YES' : 'NO'} | email=${email ? 'YES' : 'NO'} | officer=${sosData?.officerName ? sosData.officerName.substring(0,20) : 'NONE'} | incDate=${sosData?.incorporationDate || 'NONE'}`);
       respond(res, 200, {
         phone, website: siteUrl, address, email, sosUrl,
         reviewCount, businessStatus, hasHours,
@@ -845,7 +887,7 @@ async function scrapeEmail(siteUrl) {
       return true;
     });
 
-    if (clean.length === 0) return null;
+    if (clean.length === 0) { console.log('[EMAIL] no valid emails found, raw count:', all.length); return null; }
 
     // Pick best email: avoid generic prefixes, prefer business-sounding ones
     const genericPrefixes = ["info","contact","hello","admin","support","office","mail","team","sales","help","enquiries","enquiry"];
@@ -891,7 +933,187 @@ async function scrapeSOS(bizName, stateCode) {
     if (stateCode === 'TX') return await scrapeTX(bizName);
     if (stateCode === 'GA') return await scrapeGA(bizName);
     if (stateCode === 'NY') return await scrapeNY(bizName);
+    if (stateCode === 'CA') return await scrapeCA(bizName);
+    if (stateCode === 'IL') return await scrapeIL(bizName);
+    if (stateCode === 'AZ') return await scrapeAZ(bizName);
+    if (stateCode === 'CO') return await scrapeCO(bizName);
+    if (stateCode === 'OH') return await scrapeOH(bizName);
+    if (stateCode === 'PA') return await scrapePA(bizName);
+    if (stateCode === 'NC') return await scrapeNC(bizName);
+    if (stateCode === 'NJ') return await scrapeNJ(bizName);
+    if (stateCode === 'VA') return await scrapeVA(bizName);
+    if (stateCode === 'WA') return await scrapeWA(bizName);
     return null;
+  } catch(_) { return null; }
+}
+
+// ── CALIFORNIA — Bizfile Online ───────────────────────────────────
+async function scrapeCA(bizName) {
+  try {
+    const q = encodeURIComponent(bizName);
+    const json = await fetchURL(
+      `https://bizfileonline.sos.ca.gov/api/Records/businesssearch?SearchValue=${q}&SearchType=NAME&SearchField=NAME&SearchActiveOnly=true&SearchCertificated=false&SearchPage=0`,
+      5000
+    );
+    const data = JSON.parse(json);
+    const biz = data?.hits?.hits?.[0]?._source || data?.results?.[0];
+    if (!biz) return null;
+    const incDate = biz.registration_date || biz.date_filed || biz.filedate || null;
+    const officerName = biz.principal_name || biz.agent_name || biz.ceo || null;
+    return { incorporationDate: incDate, businessAge: parseAge(incDate), companyStatus: biz.status || biz.entity_status || null, officerName };
+  } catch(_) { return null; }
+}
+
+// ── ILLINOIS — ILSOS ──────────────────────────────────────────────
+async function scrapeIL(bizName) {
+  try {
+    const q = encodeURIComponent(bizName);
+    const html = await fetchURL(
+      `https://www.ilsos.gov/corporatellc/CorporateLlcController?action=CorpLlcSearch&SearchType=1&searchCriteria=${q}&SearchBtn=Search`,
+      5000
+    );
+    const dateMatch = html.match(/(?:Date Filed|File Date|Incorporation Date)[^\d]*(\d{1,2}\/\d{1,2}\/\d{4})/i) ||
+                      html.match(/(\d{2}\/\d{2}\/\d{4})/);
+    const incDate = dateMatch ? dateMatch[1] : null;
+    const statusMatch = html.match(/(?:Active|Good Standing|Dissolved|Revoked)/i);
+    const agentMatch = html.match(/(?:Registered Agent|Agent Name)[^A-Z]*([A-Z][A-Za-z\s,\.'-]{3,50})(?:<|\n)/i);
+    return { incorporationDate: incDate, businessAge: parseAge(incDate), companyStatus: statusMatch?.[0] || null, officerName: agentMatch?.[1]?.trim() || null };
+  } catch(_) { return null; }
+}
+
+// ── ARIZONA — ACC ─────────────────────────────────────────────────
+async function scrapeAZ(bizName) {
+  try {
+    const q = encodeURIComponent(bizName);
+    const json = await fetchURL(
+      `https://ecorp.azcc.gov/api/Corporations/GetBusinessInfo?businessName=${q}&includeInactive=false`,
+      5000
+    );
+    const data = JSON.parse(json);
+    const biz = Array.isArray(data) ? data[0] : data?.results?.[0] || data;
+    if (!biz?.entityName) return null;
+    const incDate = biz.incorporationDate || biz.dateIncorporated || biz.dateFormed || null;
+    const officerName = biz.statutoryAgent || biz.agentName || biz.principalOfficer || null;
+    return { incorporationDate: incDate, businessAge: parseAge(incDate), companyStatus: biz.entityStatus || biz.status || null, officerName };
+  } catch(_) { return null; }
+}
+
+// ── COLORADO — SOS ────────────────────────────────────────────────
+async function scrapeCO(bizName) {
+  try {
+    const q = encodeURIComponent(bizName);
+    const html = await fetchURL(
+      `https://www.sos.state.co.us/biz/BusinessEntityCriteriaExt.do?nameTyp=ENT&masterFileId=&entityName2=${q}&entityId2=&fileId=&srchTyp=ENTITY&action=submitEntityCriteriaExt`,
+      5000
+    );
+    const dateMatch = html.match(/(?:Date of Formation|Formation Date|Date Filed)[^\d]*(\d{1,2}\/\d{1,2}\/\d{4})/i) ||
+                      html.match(/(\d{2}\/\d{2}\/\d{4})/);
+    const incDate = dateMatch ? dateMatch[1] : null;
+    const statusMatch = html.match(/(?:Good Standing|Delinquent|Dissolved|Active)/i);
+    const agentMatch = html.match(/(?:Registered Agent)[^A-Z]*([A-Z][A-Za-z\s,\.'-]{3,50})(?:<|\n)/i);
+    return { incorporationDate: incDate, businessAge: parseAge(incDate), companyStatus: statusMatch?.[0] || null, officerName: agentMatch?.[1]?.trim() || null };
+  } catch(_) { return null; }
+}
+
+// ── OHIO — SOS ────────────────────────────────────────────────────
+async function scrapeOH(bizName) {
+  try {
+    const q = encodeURIComponent(bizName);
+    const html = await fetchURL(
+      `https://businesssearch.ohiosos.gov/?=businessDetails&q=${q}&bs=businessName&a=active`,
+      5000
+    );
+    const dateMatch = html.match(/(?:Formation Date|Date of Formation|Filing Date)[^\d]*(\d{1,2}\/\d{1,2}\/\d{4})/i) ||
+                      html.match(/(\d{2}\/\d{2}\/\d{4})/);
+    const incDate = dateMatch ? dateMatch[1] : null;
+    const statusMatch = html.match(/(?:Active|Cancelled|Dissolved)/i);
+    const agentMatch = html.match(/(?:Statutory Agent)[^A-Z]*([A-Z][A-Za-z\s,\.'-]{3,50})(?:<|\n)/i);
+    return { incorporationDate: incDate, businessAge: parseAge(incDate), companyStatus: statusMatch?.[0] || null, officerName: agentMatch?.[1]?.trim() || null };
+  } catch(_) { return null; }
+}
+
+// ── PENNSYLVANIA — DOS ────────────────────────────────────────────
+async function scrapePA(bizName) {
+  try {
+    const q = encodeURIComponent(bizName);
+    const html = await fetchURL(
+      `https://www.corporations.pa.gov/search/corpsearch?SearchType=1&SearchField=1&SearchStringEntityName=${q}&SearchStringEventNumber=&SearchCurrentName=true&SearchStatus=A`,
+      5000
+    );
+    const dateMatch = html.match(/(?:Filing Date|Effective Date|Incorporation Date)[^\d]*(\d{1,2}\/\d{1,2}\/\d{4})/i) ||
+                      html.match(/(\d{2}\/\d{2}\/\d{4})/);
+    const incDate = dateMatch ? dateMatch[1] : null;
+    const statusMatch = html.match(/(?:Active|Inactive|Dissolved)/i);
+    const agentMatch = html.match(/(?:Registered Agent|Agent)[^A-Z]*([A-Z][A-Za-z\s,\.'-]{3,50})(?:<|\n)/i);
+    return { incorporationDate: incDate, businessAge: parseAge(incDate), companyStatus: statusMatch?.[0] || null, officerName: agentMatch?.[1]?.trim() || null };
+  } catch(_) { return null; }
+}
+
+// ── NORTH CAROLINA — SOS ──────────────────────────────────────────
+async function scrapeNC(bizName) {
+  try {
+    const q = encodeURIComponent(bizName);
+    const html = await fetchURL(
+      `https://www.sosnc.gov/online_services/search/by_title/_Business_Registration?SearchTerms=${q}&StartDate=&EndDate=&Status=&EntityType=&SortOrder=AscendingByEntityName`,
+      5000
+    );
+    const dateMatch = html.match(/(?:Date Formed|Formation Date|Date Filed)[^\d]*(\d{1,2}\/\d{1,2}\/\d{4})/i) ||
+                      html.match(/(\d{2}\/\d{2}\/\d{4})/);
+    const incDate = dateMatch ? dateMatch[1] : null;
+    const statusMatch = html.match(/(?:Current-Active|Dissolved|Withdrawn|Suspended)/i);
+    const agentMatch = html.match(/(?:Registered Agent)[^A-Z]*([A-Z][A-Za-z\s,\.'-]{3,50})(?:<|\n)/i);
+    return { incorporationDate: incDate, businessAge: parseAge(incDate), companyStatus: statusMatch?.[0] || null, officerName: agentMatch?.[1]?.trim() || null };
+  } catch(_) { return null; }
+}
+
+// ── NEW JERSEY — Treasury ─────────────────────────────────────────
+async function scrapeNJ(bizName) {
+  try {
+    const q = encodeURIComponent(bizName);
+    const html = await fetchURL(
+      `https://www.njportal.com/DOR/businessrecords/EntitySearch/SearchForEntity?searchFields=${q}&searchType=ENTITY_NAME&StatusType=ACTIVE`,
+      5000
+    );
+    const dateMatch = html.match(/(?:Date Incorporated|Formation Date|Filing Date)[^\d]*(\d{1,2}\/\d{1,2}\/\d{4})/i) ||
+                      html.match(/(\d{2}\/\d{2}\/\d{4})/);
+    const incDate = dateMatch ? dateMatch[1] : null;
+    const statusMatch = html.match(/(?:Active|Inactive|Revoked)/i);
+    const agentMatch = html.match(/(?:Registered Agent)[^A-Z]*([A-Z][A-Za-z\s,\.'-]{3,50})(?:<|\n)/i);
+    return { incorporationDate: incDate, businessAge: parseAge(incDate), companyStatus: statusMatch?.[0] || null, officerName: agentMatch?.[1]?.trim() || null };
+  } catch(_) { return null; }
+}
+
+// ── VIRGINIA — SCC ────────────────────────────────────────────────
+async function scrapeVA(bizName) {
+  try {
+    const q = encodeURIComponent(bizName);
+    const html = await fetchURL(
+      `https://cis.scc.virginia.gov/EntitySearch/Index?searchTerm=${q}&searchType=0`,
+      5000
+    );
+    const dateMatch = html.match(/(?:Formation Date|Incorporation Date|Date Formed)[^\d]*(\d{1,2}\/\d{1,2}\/\d{4})/i) ||
+                      html.match(/(\d{2}\/\d{2}\/\d{4})/);
+    const incDate = dateMatch ? dateMatch[1] : null;
+    const statusMatch = html.match(/(?:Active|Inactive|Cancelled|Revoked)/i);
+    const agentMatch = html.match(/(?:Registered Agent)[^A-Z]*([A-Z][A-Za-z\s,\.'-]{3,50})(?:<|\n)/i);
+    return { incorporationDate: incDate, businessAge: parseAge(incDate), companyStatus: statusMatch?.[0] || null, officerName: agentMatch?.[1]?.trim() || null };
+  } catch(_) { return null; }
+}
+
+// ── WASHINGTON — Corporations Division ───────────────────────────
+async function scrapeWA(bizName) {
+  try {
+    const q = encodeURIComponent(bizName);
+    const html = await fetchURL(
+      `https://ccfs.sos.wa.gov/api/search?nameContains=${q}&activeOnly=true&entityTypeId=&searchType=Entity`,
+      5000
+    );
+    const data = JSON.parse(html);
+    const biz = Array.isArray(data) ? data[0] : data?.results?.[0] || data?.entities?.[0];
+    if (!biz) return null;
+    const incDate = biz.incorporationDate || biz.formationDate || biz.effectiveDate || null;
+    const officerName = biz.registeredAgentName || biz.agentName || null;
+    return { incorporationDate: incDate, businessAge: parseAge(incDate), companyStatus: biz.status || null, officerName };
   } catch(_) { return null; }
 }
 
@@ -929,18 +1151,28 @@ async function scrapeFL(bizName) {
     const statusMatch = detailHtml.match(/Active|Inactive|Dissolved/i);
     const companyStatus = statusMatch ? statusMatch[0] : null;
 
-    // Officers — Sunbiz lists them in a table, names in <span> after "Officer/Director Detail"
-    const officerSection = detailHtml.split('Officer/Director Detail')[1] || '';
-    const nameMatches = [...officerSection.matchAll(/<span[^>]*>\s*([A-Z][A-Z\s,\.'-]{3,50})\s*<\/span>/g)];
-    const officerName = nameMatches[0]?.[1]?.trim() || null;
+    // Officers — Sunbiz lists them in a table after "Officer/Director Detail"
+    const officerSection = detailHtml.split('Officer/Director Detail')[1] || detailHtml;
+    // Try multiple patterns: <span>, <td>, or plain text
+    const nameMatches = [
+      ...officerSection.matchAll(/<span[^>]*>\s*([A-Z][A-Z\s,\.'-]{2,50})\s*<\/span>/g),
+      ...officerSection.matchAll(/<td[^>]*>\s*([A-Z][A-Z\s,\.'-]{2,50})\s*<\/td>/g),
+    ];
+    // Filter out obviously non-name entries (states, titles, zip codes)
+    const skipWords = ['OFFICER', 'DIRECTOR', 'MANAGER', 'MEMBER', 'PRESIDENT', 'SECRETARY', 'TREASURER', 'REGISTERED', 'AGENT', 'FLORIDA', 'ACTIVE', 'INACTIVE'];
+    const officerName = nameMatches
+      .map(m => m[1].trim())
+      .find(n => n.length > 3 && !skipWords.includes(n) && !/^\d/.test(n) && n.split(' ').length >= 2)
+      || nameMatches[0]?.[1]?.trim() || null;
 
+    console.log(`[SOS FL] "${bizName}" → officer=${officerName || 'NONE'} | date=${incDate || 'NONE'} | status=${companyStatus || 'NONE'}`);
     return {
       incorporationDate: incDate,
       businessAge: parseAge(incDate),
       companyStatus,
       officerName,
     };
-  } catch(_) { return null; }
+  } catch(e) { console.log(`[SOS FL] FAILED for "${bizName}":`, e.message); return null; }
 }
 
 // ── TEXAS — SOS CGI search ────────────────────────────────────────
@@ -1033,21 +1265,44 @@ function googleGet(path) {
   });
 }
 
-function fetchURL(url, timeoutMs = 8000, maxBytes = 500000) {
+async function fetchURL(url, timeoutMs = 8000, maxBytes = 500000, redirectCount = 0) {
+  if (redirectCount > 5) throw new Error('Too many redirects');
   return new Promise((resolve, reject) => {
-    const proto = url.startsWith("https") ? https : http;
-    const req = proto.get(url, (res) => {
-      // handle redirects
-      if ((res.statusCode === 301 || res.statusCode === 302) && res.headers.location) {
-        resolve(fetchURL(res.headers.location, timeoutMs, maxBytes));
+    const proto = url.startsWith('https') ? https : http;
+    const parsedUrl = new URL(url);
+    const options = {
+      hostname: parsedUrl.hostname,
+      path: parsedUrl.pathname + parsedUrl.search,
+      method: 'GET',
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/json,*/*',
+        'Accept-Language': 'en-US,en;q=0.9',
+      }
+    };
+    const req = proto.request(options, (res) => {
+      // Follow redirects properly
+      if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location) {
+        res.resume(); // drain
+        const nextUrl = res.headers.location.startsWith('http')
+          ? res.headers.location
+          : `${parsedUrl.protocol}//${parsedUrl.hostname}${res.headers.location}`;
+        resolve(fetchURL(nextUrl, timeoutMs, maxBytes, redirectCount + 1));
         return;
       }
-      let data = "";
-      res.on("data", c => { data += c; if (maxBytes > 0 && data.length > maxBytes) res.destroy(); });
-      res.on("end", () => resolve(data));
-      res.on("error", reject);
-    }).on("error", reject);
-    req.setTimeout(timeoutMs, () => { req.destroy(); reject(new Error("fetchURL timeout")); });
+      if (res.statusCode === 403 || res.statusCode === 429 || res.statusCode === 503) {
+        res.resume();
+        reject(new Error(`HTTP ${res.statusCode}`));
+        return;
+      }
+      let data = '';
+      res.on('data', c => { data += c; if (maxBytes > 0 && data.length > maxBytes) res.destroy(); });
+      res.on('end', () => resolve(data));
+      res.on('error', reject);
+    });
+    req.on('error', reject);
+    req.setTimeout(timeoutMs, () => { req.destroy(); reject(new Error('fetchURL timeout')); });
+    req.end();
   });
 }
 
