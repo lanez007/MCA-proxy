@@ -268,7 +268,8 @@ const server = http.createServer(async (req, res) => {
 
   const url = new URL(req.url, `http://localhost:${PORT}`);
 
-  if (url.pathname === "/") {
+  if (url.pathname === "/" || url.pathname === "/warmup") {
+    loadSBAData(); // trigger load if not already started
     respond(res, 200, { status: "ok", service: "RCN Lead Gen API", sba_ready: !!sbaIndex, sba_loading: sbaLoading });
     return;
   }
