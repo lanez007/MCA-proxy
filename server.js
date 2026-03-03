@@ -411,7 +411,7 @@ const server = http.createServer(async (req, res) => {
         for (let page = 0; page < 3 && allPlaces.length < limit; page++) {
           const pageParam = pageToken ? `&pagetoken=${pageToken}` : '';
           if (page > 0) await new Promise(r => setTimeout(r, 2200));
-          const placesData = await googleGet(`/maps/api/place/textsearch/json?query=${enc(type)}&location=${lat},${lng}&radius=40000&key=${GOOGLE_API_KEY}${pageParam}`);
+          const placesData = await googleGet(`/maps/api/place/textsearch/json?query=${enc(type)}&location=${lat},${lng}&radius=50000&key=${GOOGLE_API_KEY}${pageParam}`);
           const results = placesData.results || [];
           allPlaces = allPlaces.concat(results);
           pageToken = placesData.next_page_token || null;
@@ -422,19 +422,32 @@ const server = http.createServer(async (req, res) => {
       await googlePagesPromise;
       const hereResults = await herePromise;
 
-      // Merge Google + HERE, dedup by normalized name
-      const seen = new Set();
+      // Merge Google + HERE, dedup by placeId first, then normalized name
+      const seenIds = new Set();
+      const seenNames = new Set();
       const merged = [];
       for (const p of allPlaces) {
-        const key = (p.name || '').toLowerCase().replace(/[^a-z0-9]/g, '').substring(0, 20);
-        if (key && !seen.has(key)) { seen.add(key); merged.push({...p, _source: 'google'}); }
+        const idKey = p.place_id || '';
+        const nameKey = (p.name || '').toLowerCase().replace(/[^a-z0-9]/g, '').substring(0, 25);
+        if (!nameKey) continue;
+        if (idKey && seenIds.has(idKey)) continue;
+        if (seenNames.has(nameKey)) continue;
+        if (idKey) seenIds.add(idKey);
+        seenNames.add(nameKey);
+        merged.push({...p, _source: 'google'});
       }
       for (const h of hereResults) {
-        const key = (h.businessName || '').toLowerCase().replace(/[^a-z0-9]/g, '').substring(0, 20);
-        if (key && !seen.has(key)) { seen.add(key); merged.push({...h, _source: 'here'}); }
+        const idKey = h.placeId || '';
+        const nameKey = (h.businessName || '').toLowerCase().replace(/[^a-z0-9]/g, '').substring(0, 25);
+        if (!nameKey) continue;
+        if (idKey && seenIds.has(idKey)) continue;
+        if (seenNames.has(nameKey)) continue;
+        if (idKey) seenIds.add(idKey);
+        seenNames.add(nameKey);
+        merged.push({...h, _source: 'here'});
       }
 
-      const places = merged.slice(0, limit * 2);
+      const places = merged.slice(0, limit * 3); // give Details API more to work with
       const actualCount = Math.min(merged.length, limit);
 
       // Batch Details — Google needs Places API call, HERE already has phone/website
@@ -516,6 +529,31 @@ const server = http.createServer(async (req, res) => {
   }
 
   // SBA LOOKUP — match business name against loaded SBA data
+  if (url.pathname === "/sba-debug") {
+    const decoded = verifyToken(req);
+    if (!decoded) { respond(res, 401, { error: "Unauthorized" }); return; }
+    if (!sbaIndex) { respond(res, 503, { status: "unavailable", message: sbaLoadError || "Not loaded" }); return; }
+    const keys = Object.keys(sbaIndex);
+    const testName = url.searchParams.get("name") || "";
+    const testKey = testName ? normalizeName(testName) : "";
+    const testResult = testName ? lookupSBA(testName, url.searchParams.get("state") || "") : null;
+    // Find sample FL records
+    const flSamples = [];
+    for (const [k, records] of Object.entries(sbaIndex)) {
+      if (records.some(r => r.state === "FL")) { flSamples.push({key: k, name: records[0].name, amount: records[0].amount}); }
+      if (flSamples.length >= 10) break;
+    }
+    respond(res, 200, {
+      total_keys: keys.length,
+      sample_keys: keys.slice(0, 20),
+      fl_samples: flSamples,
+      test_input: testName,
+      test_normalized: testKey,
+      test_result: testResult,
+    });
+    return;
+  }
+
   if (url.pathname === "/sba-lookup") {
     const decoded = verifyToken(req);
     if (!decoded) { respond(res, 401, { error: "Unauthorized" }); return; }
