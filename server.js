@@ -8,6 +8,7 @@ const PORT = process.env.PORT || 3000;
 const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;
 const POSTGRES_URL = process.env.POSTGRES_URL;
 const JWT_SECRET = process.env.JWT_SECRET || "rcn-lead-gen-secret-change-in-prod";
+const HERE_API_KEY = process.env.HERE_API_KEY || null;
 
 const SBA_CSV_URL = "https://data.sba.gov/dataset/0ff8e8e9-b967-4f4e-987c-6ac78c575087/resource/d67d3ccb-2002-4134-a288-481b51cd3479/download/foia-7a-fy2020-present-as-of-251231.csv";
 
@@ -344,29 +345,64 @@ const server = http.createServer(async (req, res) => {
       if (!geoData.results?.[0]) { respond(res, 404, { error: "Location not found" }); return; }
       const { lat, lng } = geoData.results[0].geometry.location;
 
-      // Fetch up to 3 pages from Google Places (20 results each = up to 60 total)
+      // Fetch Google Places (up to 3 pages) + HERE in parallel
       let allPlaces = [];
       let pageToken = null;
-      for (let page = 0; page < 3 && allPlaces.length < limit; page++) {
-        const pageParam = pageToken ? `&pagetoken=${pageToken}` : '';
-        if (page > 0) await new Promise(r => setTimeout(r, 2200)); // Google requires delay between pages
-        const placesData = await googleGet(`/maps/api/place/textsearch/json?query=${enc(type)}&location=${lat},${lng}&radius=40000&key=${GOOGLE_API_KEY}${pageParam}`);
-        const results = placesData.results || [];
-        allPlaces = allPlaces.concat(results);
-        pageToken = placesData.next_page_token || null;
-        if (!pageToken) break;
-      }
-      const places = allPlaces.slice(0, limit);
-      const actualCount = places.length;
-
-      const detailed = (await Promise.all(places.map(async (p) => {
-        try {
-          const d = await googleGet(`/maps/api/place/details/json?place_id=${p.place_id}&fields=formatted_phone_number,website,formatted_address,opening_hours,business_status,user_ratings_total&key=${GOOGLE_API_KEY}`);
-          return { businessName: p.name, address: d.result?.formatted_address || p.formatted_address || "", phone: d.result?.formatted_phone_number || null, website: d.result?.website || null, placeId: p.place_id, rating: p.rating || null, reviewCount: p.user_ratings_total || 0, source: 'google' };
-        } catch(_) {
-          return { businessName: p.name, address: p.formatted_address || "", phone: null, website: null, placeId: p.place_id, rating: p.rating || null, reviewCount: p.user_ratings_total || 0, source: 'google' };
+      const googlePagesPromise = (async () => {
+        for (let page = 0; page < 3 && allPlaces.length < limit; page++) {
+          const pageParam = pageToken ? `&pagetoken=${pageToken}` : '';
+          if (page > 0) await new Promise(r => setTimeout(r, 2200));
+          const placesData = await googleGet(`/maps/api/place/textsearch/json?query=${enc(type)}&location=${lat},${lng}&radius=40000&key=${GOOGLE_API_KEY}${pageParam}`);
+          const results = placesData.results || [];
+          allPlaces = allPlaces.concat(results);
+          pageToken = placesData.next_page_token || null;
+          if (!pageToken) break;
         }
-      }))).filter(b => b.phone || b.website).slice(0, limit);
+      })();
+      const herePromise = hereSearch(type, lat, lng, limit);
+      await googlePagesPromise;
+      const hereResults = await herePromise;
+
+      // Merge Google + HERE, dedup by normalized name
+      const seen = new Set();
+      const merged = [];
+      for (const p of allPlaces) {
+        const key = (p.name || '').toLowerCase().replace(/[^a-z0-9]/g, '').substring(0, 20);
+        if (key && !seen.has(key)) { seen.add(key); merged.push({...p, _source: 'google'}); }
+      }
+      for (const h of hereResults) {
+        const key = (h.businessName || '').toLowerCase().replace(/[^a-z0-9]/g, '').substring(0, 20);
+        if (key && !seen.has(key)) { seen.add(key); merged.push({...h, _source: 'here'}); }
+      }
+
+      const places = merged.slice(0, limit * 2);
+      const actualCount = Math.min(merged.length, limit);
+
+      // Batch Details — Google needs Places API call, HERE already has phone/website
+      const detailedRaw = [];
+      const googlePlaces = places.filter(p => p._source === 'google');
+      const herePlaces   = places.filter(p => p._source === 'here');
+
+      // HERE leads already have details — normalize directly
+      for (const h of herePlaces) {
+        detailedRaw.push({ businessName: h.businessName, address: h.address, phone: h.phone, website: h.website, placeId: h.placeId, rating: h.rating, reviewCount: h.reviewCount, source: 'here' });
+      }
+
+      // Google leads need Details API call — batch in groups of 5
+      for (let i = 0; i < googlePlaces.length; i += 5) {
+        const batch = googlePlaces.slice(i, i + 5);
+        const batchResults = await Promise.all(batch.map(async (p) => {
+          try {
+            const d = await googleGet(`/maps/api/place/details/json?place_id=${p.place_id}&fields=formatted_phone_number,website,formatted_address,opening_hours,business_status,user_ratings_total&key=${GOOGLE_API_KEY}`);
+            return { businessName: p.name, address: d.result?.formatted_address || p.formatted_address || "", phone: d.result?.formatted_phone_number || null, website: d.result?.website || null, placeId: p.place_id, rating: p.rating || null, reviewCount: p.user_ratings_total || 0, source: 'google' };
+          } catch(_) {
+            return { businessName: p.name, address: p.formatted_address || "", phone: null, website: null, placeId: p.place_id, rating: p.rating || null, reviewCount: p.user_ratings_total || 0, source: 'google' };
+          }
+        }));
+        detailedRaw.push(...batchResults);
+        if (i + 5 < googlePlaces.length) await new Promise(r => setTimeout(r, 200));
+      }
+      const detailed = detailedRaw.slice(0, limit);
       await pool.query("UPDATE users SET searches_used = searches_used + $1 WHERE id = $2", [actualCount, user.id]);
       const newUsed = user.searches_used + actualCount;
       respond(res, 200, { results: detailed, searches_used: newUsed, searches_remaining: planLimit === Infinity ? null : planLimit - newUsed, limit: planLimit === Infinity ? null : planLimit });
@@ -721,6 +757,27 @@ async function scrapeEmail(siteUrl) {
     const generic = clean.find(e => !noReplyPrefixes.some(p => e.toLowerCase().startsWith(p)));
     return best || generic || clean[0] || null;
   } catch(_) { return null; }
+}
+
+// ─── HERE PLACES SEARCH ──────────────────────────────────────────
+async function hereSearch(term, lat, lng, limit) {
+  if (!HERE_API_KEY) return [];
+  try {
+    const q = encodeURIComponent(term);
+    const url = `https://discover.search.hereapi.com/v1/discover?at=${lat},${lng}&q=${q}&limit=${Math.min(limit, 100)}&apiKey=${HERE_API_KEY}`;
+    const raw = await fetchURL(url, 6000);
+    const data = JSON.parse(raw);
+    return (data.items || []).map(item => ({
+      businessName: item.title,
+      address: item.address?.label || '',
+      phone: item.contacts?.[0]?.phone?.[0]?.value || null,
+      website: item.contacts?.[0]?.www?.[0]?.value || null,
+      placeId: 'here_' + item.id,
+      rating: null,
+      reviewCount: 0,
+      source: 'here',
+    }));
+  } catch(_) { return []; }
 }
 
 // ─── FL + TX + GA SOS SCRAPERS ───────────────────────────────────
