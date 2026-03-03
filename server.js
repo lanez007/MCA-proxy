@@ -330,7 +330,7 @@ const server = http.createServer(async (req, res) => {
     if (!decoded) { respond(res, 401, { error: "Unauthorized — please log in" }); return; }
     const type     = url.searchParams.get("type") || "";
     const location = url.searchParams.get("location") || "";
-    const limit    = Math.min(parseInt(url.searchParams.get("limit") || "10"), 25);
+    const limit    = Math.min(parseInt(url.searchParams.get("limit") || "10"), 60);
     try {
       const user = await getUser(decoded.userId);
       if (!user) { respond(res, 401, { error: "User not found" }); return; }
@@ -343,17 +343,30 @@ const server = http.createServer(async (req, res) => {
       const geoData = await googleGet(`/maps/api/geocode/json?address=${enc(location)}&key=${GOOGLE_API_KEY}`);
       if (!geoData.results?.[0]) { respond(res, 404, { error: "Location not found" }); return; }
       const { lat, lng } = geoData.results[0].geometry.location;
-      const placesData = await googleGet(`/maps/api/place/textsearch/json?query=${enc(type)}&location=${lat},${lng}&radius=30000&key=${GOOGLE_API_KEY}`);
-      const places = (placesData.results || []).slice(0, limit);
+
+      // Fetch up to 3 pages from Google Places (20 results each = up to 60 total)
+      let allPlaces = [];
+      let pageToken = null;
+      for (let page = 0; page < 3 && allPlaces.length < limit; page++) {
+        const pageParam = pageToken ? `&pagetoken=${pageToken}` : '';
+        if (page > 0) await new Promise(r => setTimeout(r, 2200)); // Google requires delay between pages
+        const placesData = await googleGet(`/maps/api/place/textsearch/json?query=${enc(type)}&location=${lat},${lng}&radius=40000&key=${GOOGLE_API_KEY}${pageParam}`);
+        const results = placesData.results || [];
+        allPlaces = allPlaces.concat(results);
+        pageToken = placesData.next_page_token || null;
+        if (!pageToken) break;
+      }
+      const places = allPlaces.slice(0, limit);
       const actualCount = places.length;
-      const detailed = await Promise.all(places.map(async (p) => {
+
+      const detailed = (await Promise.all(places.map(async (p) => {
         try {
           const d = await googleGet(`/maps/api/place/details/json?place_id=${p.place_id}&fields=formatted_phone_number,website,formatted_address,opening_hours,business_status,user_ratings_total&key=${GOOGLE_API_KEY}`);
-          return { businessName: p.name, address: d.result?.formatted_address || p.formatted_address || "", phone: d.result?.formatted_phone_number || null, website: d.result?.website || null, placeId: p.place_id, rating: p.rating || null, reviewCount: p.user_ratings_total || 0 };
+          return { businessName: p.name, address: d.result?.formatted_address || p.formatted_address || "", phone: d.result?.formatted_phone_number || null, website: d.result?.website || null, placeId: p.place_id, rating: p.rating || null, reviewCount: p.user_ratings_total || 0, source: 'google' };
         } catch(_) {
-          return { businessName: p.name, address: p.formatted_address || "", phone: null, website: null, placeId: p.place_id, rating: p.rating || null, reviewCount: p.user_ratings_total || 0 };
+          return { businessName: p.name, address: p.formatted_address || "", phone: null, website: null, placeId: p.place_id, rating: p.rating || null, reviewCount: p.user_ratings_total || 0, source: 'google' };
         }
-      }));
+      }))).filter(b => b.phone || b.website).slice(0, limit);
       await pool.query("UPDATE users SET searches_used = searches_used + $1 WHERE id = $2", [actualCount, user.id]);
       const newUsed = user.searches_used + actualCount;
       respond(res, 200, { results: detailed, searches_used: newUsed, searches_remaining: planLimit === Infinity ? null : planLimit - newUsed, limit: planLimit === Infinity ? null : planLimit });
@@ -375,18 +388,30 @@ const server = http.createServer(async (req, res) => {
       const phone   = d.result?.formatted_phone_number || null;
       const siteUrl = d.result?.website || websiteHint || null;
       const address = d.result?.formatted_address || null;
-      let email = null;
-      if (siteUrl) {
-        email = await Promise.race([
-          scrapeEmail(siteUrl),
-          new Promise(r => setTimeout(() => r(null), 4000))
-        ]);
-      }
       const sosUrl = buildSOSUrl(bizName, bizState);
       const reviewCount = d.result?.user_ratings_total || null;
       const businessStatus = d.result?.business_status || null;
       const hasHours = !!(d.result?.opening_hours);
-      respond(res, 200, { phone, website: siteUrl, address, email, sosUrl, reviewCount, businessStatus, hasHours });
+
+      // Run email scrape + SOS lookup in parallel to save time
+      const [email, sosData] = await Promise.all([
+        siteUrl
+          ? Promise.race([scrapeEmail(siteUrl), new Promise(r => setTimeout(() => r(null), 8000))])
+          : Promise.resolve(null),
+        Promise.race([
+          scrapeSOS(bizName, bizState),
+          new Promise(r => setTimeout(() => r(null), 5000))
+        ]),
+      ]);
+
+      respond(res, 200, {
+        phone, website: siteUrl, address, email, sosUrl,
+        reviewCount, businessStatus, hasHours,
+        incorporationDate: sosData?.incorporationDate || null,
+        businessAge: sosData?.businessAge || null,
+        companyStatus: sosData?.companyStatus || null,
+        officerName: sosData?.officerName || null,
+      });
     } catch(err) { console.error(err); respond(res, 500, { error: err.message }); }
     return;
   }
@@ -654,35 +679,188 @@ async function scrapeEmail(siteUrl) {
     const urlObj = new URL(siteUrl);
     const proto = urlObj.protocol === "https:" ? https : http;
     const host = urlObj.hostname;
-    // Check multiple pages in parallel for best coverage
-    const [homeEmails, contactEmails, aboutEmails, contact2Emails] = await Promise.all([
-      fetchPageEmails(host, "/", proto),
-      fetchPageEmails(host, "/contact", proto),
-      fetchPageEmails(host, "/about", proto),
-      fetchPageEmails(host, "/contact-us", proto),
-    ]);
-    const all = [...new Set([...homeEmails, ...contactEmails, ...aboutEmails, ...contact2Emails])];
-    // Filter out obvious junk
-    const clean = all.filter(e =>
-      !e.includes("example.com") && !e.includes("sentry.io") &&
-      !e.includes("wix.com") && !e.includes("wordpress") &&
-      !e.includes("schema.org") && !e.includes("@2x") &&
-      !e.endsWith(".png") && !e.endsWith(".jpg") &&
-      !e.includes("jquery") && !e.includes("bootstrap") &&
-      !e.includes("googleapis") && !e.includes("cloudflare") &&
-      !e.includes("fontawesome") && e.length < 60
+
+    // Check 6 common pages in parallel
+    const paths = ["/", "/contact", "/contact-us", "/about", "/about-us", "/get-in-touch"];
+    const results = await Promise.all(paths.map(p => fetchPageEmails(host, p, proto)));
+    const all = [...new Set(results.flat())];
+
+    // Aggressive junk filter
+    const junkDomains = ["example.com","sentry.io","wix.com","wordpress","schema.org",
+      "jquery","bootstrap","googleapis","cloudflare","fontawesome","squarespace",
+      "godaddy","weebly","shopify","mailchimp","sendgrid","amazonaws","jsdelivr",
+      "unpkg.com","cdnjs","facebook.com","twitter.com","instagram.com","linkedin.com",
+      "youtube.com","tiktok.com","google.com","apple.com","microsoft.com"];
+    const junkExts = [".png",".jpg",".gif",".svg",".webp",".woff",".ttf",".js",".css"];
+    const junkPrefixes = ["noreply","no-reply","donotreply","do-not-reply","bounce","mailer-daemon","postmaster"];
+
+    const clean = all.filter(e => {
+      const lower = e.toLowerCase();
+      if (e.length > 70 || e.length < 6) return false;
+      if (junkDomains.some(d => lower.includes(d))) return false;
+      if (junkExts.some(x => lower.endsWith(x))) return false;
+      if (lower.includes("@2x") || lower.includes("@3x")) return false;
+      // must have valid TLD
+      const parts = e.split("@");
+      if (parts.length !== 2) return false;
+      const domain = parts[1];
+      if (!domain.includes(".") || domain.endsWith(".")) return false;
+      return true;
+    });
+
+    if (clean.length === 0) return null;
+
+    // Pick best email: avoid generic prefixes, prefer business-sounding ones
+    const genericPrefixes = ["info","contact","hello","admin","support","office","mail","team","sales","help","enquiries","enquiry"];
+    const noReplyPrefixes = ["noreply","no-reply","donotreply"];
+
+    const best = clean.find(e => {
+      const local = e.split("@")[0].toLowerCase();
+      return !genericPrefixes.includes(local) && !noReplyPrefixes.some(p => local.startsWith(p));
+    });
+    const generic = clean.find(e => !noReplyPrefixes.some(p => e.toLowerCase().startsWith(p)));
+    return best || generic || clean[0] || null;
+  } catch(_) { return null; }
+}
+
+// ─── FL + TX + GA SOS SCRAPERS ───────────────────────────────────
+
+// Master dispatcher — picks scraper by state
+async function scrapeSOS(bizName, stateCode) {
+  if (!bizName) return null;
+  try {
+    if (stateCode === 'FL') return await scrapeFL(bizName);
+    if (stateCode === 'TX') return await scrapeTX(bizName);
+    if (stateCode === 'GA') return await scrapeGA(bizName);
+    if (stateCode === 'NY') return await scrapeNY(bizName);
+    return null;
+  } catch(_) { return null; }
+}
+
+function parseAge(dateStr) {
+  if (!dateStr) return null;
+  try {
+    const d = new Date(dateStr);
+    if (isNaN(d)) return null;
+    return Math.floor((Date.now() - d) / (1000*60*60*24*365));
+  } catch(_) { return null; }
+}
+
+// ── FLORIDA — Sunbiz ─────────────────────────────────────────────
+async function scrapeFL(bizName) {
+  try {
+    const q = encodeURIComponent(bizName);
+    const searchHtml = await fetchURL(
+      `https://search.sunbiz.org/Inquiry/CorporationSearch/SearchResults?inquirytype=EntityName&searchNameOrder=&masterDataToSearch=&inquiryDirectionType=ForwardList&startingDetailId=&viewType=DetailView&searchStatus=Active&filingType=All&searchTerm=${q}`
     );
-    // Priority: owner-sounding emails first, then generic business, then anything
-    const priority = clean.find(e =>
-      !e.startsWith("noreply") && !e.startsWith("no-reply") &&
-      !e.startsWith("info@") && !e.startsWith("admin@") &&
-      !e.startsWith("contact@") && !e.startsWith("hello@") &&
-      !e.startsWith("support@")
+    // Pull first detail link e.g. /Inquiry/CorporationSearch/GetFilingInformation?objectId=P21000012345
+    const objMatch = searchHtml.match(/GetFilingInformation\?objectId=([A-Z0-9]+)/);
+    if (!objMatch) return null;
+
+    const detailHtml = await fetchURL(
+      `https://search.sunbiz.org/Inquiry/CorporationSearch/GetFilingInformation?objectId=${objMatch[1]}`
     );
-    const fallback = clean.find(e =>
-      !e.startsWith("noreply") && !e.startsWith("no-reply")
+
+    // Filing date
+    const filedMatch = detailHtml.match(/Filing Date[^<]*<[^>]+>([^<]+)</) ||
+                       detailHtml.match(/Date Filed[^<]*<[^>]+>([^<]+)</) ||
+                       detailHtml.match(/(\d{2}\/\d{2}\/\d{4})/);
+    const incDate = filedMatch ? filedMatch[1].trim() : null;
+
+    // Status
+    const statusMatch = detailHtml.match(/Active|Inactive|Dissolved/i);
+    const companyStatus = statusMatch ? statusMatch[0] : null;
+
+    // Officers — Sunbiz lists them in a table, names in <span> after "Officer/Director Detail"
+    const officerSection = detailHtml.split('Officer/Director Detail')[1] || '';
+    const nameMatches = [...officerSection.matchAll(/<span[^>]*>\s*([A-Z][A-Z\s,\.'-]{3,50})\s*<\/span>/g)];
+    const officerName = nameMatches[0]?.[1]?.trim() || null;
+
+    return {
+      incorporationDate: incDate,
+      businessAge: parseAge(incDate),
+      companyStatus,
+      officerName,
+    };
+  } catch(_) { return null; }
+}
+
+// ── TEXAS — SOS CGI search ────────────────────────────────────────
+async function scrapeTX(bizName) {
+  try {
+    const q = encodeURIComponent(bizName);
+    // TX SOS has an older CGI endpoint that returns HTML
+    const html = await fetchURL(
+      `https://mycpa.cpa.state.tx.us/coa/coaSearchBtn.do?bus_name=${q}&bus_type=ALL&action=Search`
     );
-    return priority || fallback || clean[0] || null;
+
+    // Filing date pattern in TX results
+    const dateMatch = html.match(/Filing Date[:\s]*(\d{1,2}\/\d{1,2}\/\d{4})/) ||
+                      html.match(/Formed[:\s]*(\d{1,2}\/\d{1,2}\/\d{4})/);
+    const incDate = dateMatch ? dateMatch[1] : null;
+
+    // Status
+    const statusMatch = html.match(/Status[:\s<>]*([A-Za-z\s]{3,20}?)</) ;
+    const companyStatus = statusMatch ? statusMatch[1].trim() : null;
+
+    // Officer / registered agent name
+    const agentMatch = html.match(/Registered Agent[:\s<>bdr]*([A-Z][A-Za-z\s,\.'-]{3,60}?)</) ||
+                       html.match(/Officer[:\s<>bdr]*([A-Z][A-Za-z\s,\.'-]{3,60}?)</);
+    const officerName = agentMatch ? agentMatch[1].trim() : null;
+
+    return {
+      incorporationDate: incDate,
+      businessAge: parseAge(incDate),
+      companyStatus,
+      officerName,
+    };
+  } catch(_) { return null; }
+}
+
+// ── GEORGIA — eCorp JSON API ──────────────────────────────────────
+async function scrapeGA(bizName) {
+  try {
+    const q = encodeURIComponent(bizName);
+    // GA eCorp returns HTML — parse it directly
+    const html = await fetchURL(
+      `https://ecorp.sos.ga.gov/BusinessSearch/BusinessInformation?nameContains=${q}&businessType=&businessStatus=Active&SortField=BusinessName&SortOrder=asc&SearchMode=2&StartIndex=0&NumResults=5`,
+      4000
+    );
+    // Look for date patterns like "01/15/2018" or "2018-01-15"
+    const dateMatch = html.match(/(?:Formation|Registration|Filing|Incorporated)[^\d]*(\d{1,2}\/\d{1,2}\/\d{4})/) ||
+                      html.match(/(?:Formation|Registration|Filing|Incorporated)[^\d]*(\d{4}-\d{2}-\d{2})/);
+    const incDate = dateMatch ? dateMatch[1] : null;
+    // Status
+    const statusMatch = html.match(/(?:Active|Inactive|Dissolved|Revoked|Admin Dissolved)/i);
+    const companyStatus = statusMatch ? statusMatch[0] : null;
+    // Registered agent — usually a proper name in all caps
+    const agentMatch = html.match(/Registered Agent[^A-Z]*([A-Z][A-Z\s,\.'-]{3,60}?)(?:<|\n)/);
+    const officerName = agentMatch ? agentMatch[1].trim() : null;
+    return { incorporationDate: incDate, businessAge: parseAge(incDate), companyStatus, officerName };
+  } catch(_) { return null; }
+}
+
+// ── NEW YORK — DOS API ────────────────────────────────────────────
+async function scrapeNY(bizName) {
+  try {
+    const q = encodeURIComponent(bizName);
+    // NY DOS open data — correct dataset for active corporations/LLCs
+    // Dataset: DOS Corporation & Business Entity Database
+    const json = await fetchURL(
+      `https://data.ny.gov/resource/ej5i-h7qk.json?$where=current_entity_name+like+%27${encodeURIComponent(bizName.replace(/'/g,""))}%25%27&$limit=5`,
+      4000
+    );
+    const data = JSON.parse(json);
+    const biz = data?.[0];
+    if (!biz) return null;
+
+    const incDate = biz.date_of_initial_dos_filing || biz.initial_dos_filing_date || null;
+    return {
+      incorporationDate: incDate ? incDate.split('T')[0] : null,
+      businessAge: parseAge(incDate),
+      companyStatus: biz.current_entity_status || biz.dos_process_status || null,
+      officerName: biz.registered_agent_name || biz.ceo_name || null,
+    };
   } catch(_) { return null; }
 }
 
@@ -697,20 +875,21 @@ function googleGet(path) {
   });
 }
 
-function fetchURL(url) {
+function fetchURL(url, timeoutMs = 8000) {
   return new Promise((resolve, reject) => {
     const proto = url.startsWith("https") ? https : http;
-    proto.get(url, (res) => {
+    const req = proto.get(url, (res) => {
       // handle redirects
       if ((res.statusCode === 301 || res.statusCode === 302) && res.headers.location) {
-        resolve(fetchURL(res.headers.location));
+        resolve(fetchURL(res.headers.location, timeoutMs));
         return;
       }
       let data = "";
-      res.on("data", c => data += c);
+      res.on("data", c => { data += c; if (data.length > 500000) res.destroy(); });
       res.on("end", () => resolve(data));
       res.on("error", reject);
     }).on("error", reject);
+    req.setTimeout(timeoutMs, () => { req.destroy(); reject(new Error("fetchURL timeout")); });
   });
 }
 
