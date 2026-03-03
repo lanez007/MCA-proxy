@@ -49,54 +49,89 @@ function parseCSVLine(line) {
 async function loadSBAData() {
   if (sbaIndex || sbaLoading) return;
   sbaLoading = true;
-  console.log("📊 Loading SBA data from government URL...");
+  console.log("📊 Loading SBA data (streaming)...");
   try {
-    const csvText = await fetchURL(SBA_CSV_URL);
-    const lines = csvText.split("\n");
-    const headers = parseCSVLine(lines[0]).map(h => h.replace(/"/g, "").trim());
-    const idx = {
-      name:   headers.findIndex(h => /BorrowerName/i.test(h)),
-      city:   headers.findIndex(h => /BorrowerCity/i.test(h)),
-      state:  headers.findIndex(h => /BorrowerState/i.test(h)),
-      naics:  headers.findIndex(h => /NaicsCode/i.test(h)),
-      amount: headers.findIndex(h => /GrossApproval/i.test(h)),
-      date:   headers.findIndex(h => /ApprovalDate/i.test(h)),
-      lender: headers.findIndex(h => /BankName/i.test(h)),
-      jobs:   headers.findIndex(h => /JobsSupported/i.test(h)),
-    };
-    const index = {};
-    let count = 0;
-    for (let i = 1; i < lines.length; i++) {
-      if (!lines[i].trim()) continue;
-      const cols = parseCSVLine(lines[i]);
-      const name = (cols[idx.name] || "").replace(/"/g, "").trim();
-      if (!name) continue;
-      const amount = parseFloat((cols[idx.amount] || "0").replace(/[^0-9.]/g, "")) || 0;
-      if (amount < 10000) continue;
-      const key = normalizeName(name);
-      if (!key) continue;
-      const record = {
-        name,
-        city:   (cols[idx.city]   || "").replace(/"/g, "").trim(),
-        state:  (cols[idx.state]  || "").replace(/"/g, "").trim().toUpperCase(),
-        naics:  (cols[idx.naics]  || "").replace(/"/g, "").trim(),
-        amount,
-        date:   (cols[idx.date]   || "").replace(/"/g, "").trim(),
-        lender: (cols[idx.lender] || "").replace(/"/g, "").trim(),
-        jobs:   parseInt((cols[idx.jobs] || "0").replace(/[^0-9]/g, "")) || 0,
-        estMonthlyRevenue: Math.round((amount * 8) / 12),
-      };
-      if (!index[key]) index[key] = [];
-      index[key].push(record);
-      count++;
-    }
-    sbaIndex = index;
-    sbaLoading = false;
-    console.log(`✅ SBA data loaded — ${count} records indexed`);
+    await new Promise((resolve, reject) => {
+      const proto = SBA_CSV_URL.startsWith("https") ? https : http;
+      const req = proto.get(SBA_CSV_URL, (res) => {
+        if ((res.statusCode === 301 || res.statusCode === 302) && res.headers.location) {
+          req.destroy();
+          // follow redirect
+          const redir = res.headers.location;
+          const rproto = redir.startsWith("https") ? https : http;
+          const rreq = rproto.get(redir, streamResponse).on("error", reject);
+          rreq.setTimeout(300000, () => { rreq.destroy(); reject(new Error("SBA redirect timeout")); });
+          return;
+        }
+        streamResponse(res);
+      }).on("error", reject);
+      req.setTimeout(300000, () => { req.destroy(); reject(new Error("SBA download timeout")); });
+
+      function streamResponse(res) {
+        const index = {};
+        let count = 0;
+        let headerParsed = false;
+        let idx = {};
+        let leftover = "";
+
+        res.on("data", chunk => {
+          const text = leftover + chunk.toString();
+          const lines = text.split("\n");
+          leftover = lines.pop(); // last partial line saved for next chunk
+          for (const line of lines) {
+            if (!line.trim()) continue;
+            if (!headerParsed) {
+              const headers = parseCSVLine(line).map(h => h.replace(/"/g, "").trim());
+              idx = {
+                name:   headers.findIndex(h => /BorrowerName/i.test(h)),
+                city:   headers.findIndex(h => /BorrowerCity/i.test(h)),
+                state:  headers.findIndex(h => /BorrowerState/i.test(h)),
+                naics:  headers.findIndex(h => /NaicsCode/i.test(h)),
+                amount: headers.findIndex(h => /GrossApproval/i.test(h)),
+                date:   headers.findIndex(h => /ApprovalDate/i.test(h)),
+                lender: headers.findIndex(h => /BankName/i.test(h)),
+                jobs:   headers.findIndex(h => /JobsSupported/i.test(h)),
+              };
+              headerParsed = true;
+              continue;
+            }
+            const cols = parseCSVLine(line);
+            const name = (cols[idx.name] || "").replace(/"/g, "").trim();
+            if (!name) continue;
+            const amount = parseFloat((cols[idx.amount] || "0").replace(/[^0-9.]/g, "")) || 0;
+            if (amount < 10000) continue;
+            const key = normalizeName(name);
+            if (!key) continue;
+            const record = {
+              name,
+              city:   (cols[idx.city]   || "").replace(/"/g, "").trim(),
+              state:  (cols[idx.state]  || "").replace(/"/g, "").trim().toUpperCase(),
+              naics:  (cols[idx.naics]  || "").replace(/"/g, "").trim(),
+              amount,
+              date:   (cols[idx.date]   || "").replace(/"/g, "").trim(),
+              lender: (cols[idx.lender] || "").replace(/"/g, "").trim(),
+              jobs:   parseInt((cols[idx.jobs] || "0").replace(/[^0-9]/g, "")) || 0,
+              estMonthlyRevenue: Math.round((amount * 8) / 12),
+            };
+            if (!index[key]) index[key] = [];
+            index[key].push(record);
+            count++;
+          }
+        });
+        res.on("end", () => {
+          sbaIndex = index;
+          sbaLoading = false;
+          console.log(`✅ SBA data loaded — ${count} records indexed`);
+          resolve();
+        });
+        res.on("error", reject);
+      }
+    });
   } catch(err) {
     sbaLoadError = err.message;
     sbaLoading = false;
-    console.error("❌ SBA load failed:", err.message);
+    console.error("❌ SBA load failed:", err.message, "— will retry in 30s");
+    setTimeout(loadSBAData, 30000);
   }
 }
 
@@ -420,14 +455,18 @@ const server = http.createServer(async (req, res) => {
     const bizState    = url.searchParams.get("state") || "";
     if (!placeId) { respond(res, 400, { error: "placeId required" }); return; }
     try {
-      const d = await googleGet(`/maps/api/place/details/json?place_id=${placeId}&fields=formatted_phone_number,website,formatted_address,opening_hours,business_status,user_ratings_total&key=${GOOGLE_API_KEY}`);
-      const phone   = d.result?.formatted_phone_number || null;
-      const siteUrl = d.result?.website || websiteHint || null;
-      const address = d.result?.formatted_address || null;
+      // HERE leads have 'here_' prefix — skip Google Details call for them
+      let phone = null, siteUrl = websiteHint || null, address = null, reviewCount = null, businessStatus = null, hasHours = false;
+      if (!placeId.startsWith('here_')) {
+        const d = await googleGet(`/maps/api/place/details/json?place_id=${placeId}&fields=formatted_phone_number,website,formatted_address,opening_hours,business_status,user_ratings_total&key=${GOOGLE_API_KEY}`);
+        phone   = d.result?.formatted_phone_number || null;
+        siteUrl = d.result?.website || websiteHint || null;
+        address = d.result?.formatted_address || null;
+        reviewCount    = d.result?.user_ratings_total || null;
+        businessStatus = d.result?.business_status || null;
+        hasHours       = !!(d.result?.opening_hours);
+      }
       const sosUrl = buildSOSUrl(bizName, bizState);
-      const reviewCount = d.result?.user_ratings_total || null;
-      const businessStatus = d.result?.business_status || null;
-      const hasHours = !!(d.result?.opening_hours);
 
       // Run email scrape + SOS lookup in parallel to save time
       const [email, sosData] = await Promise.all([
@@ -932,17 +971,17 @@ function googleGet(path) {
   });
 }
 
-function fetchURL(url, timeoutMs = 8000) {
+function fetchURL(url, timeoutMs = 8000, maxBytes = 500000) {
   return new Promise((resolve, reject) => {
     const proto = url.startsWith("https") ? https : http;
     const req = proto.get(url, (res) => {
       // handle redirects
       if ((res.statusCode === 301 || res.statusCode === 302) && res.headers.location) {
-        resolve(fetchURL(res.headers.location, timeoutMs));
+        resolve(fetchURL(res.headers.location, timeoutMs, maxBytes));
         return;
       }
       let data = "";
-      res.on("data", c => { data += c; if (data.length > 500000) res.destroy(); });
+      res.on("data", c => { data += c; if (maxBytes > 0 && data.length > maxBytes) res.destroy(); });
       res.on("end", () => resolve(data));
       res.on("error", reject);
     }).on("error", reject);
