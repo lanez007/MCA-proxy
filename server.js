@@ -26,7 +26,7 @@ let sbaLoadError = null;
 
 function normalizeName(name) {
   return name.toLowerCase()
-    .replace(/\b(llc|inc|corp|co|ltd|dba|the|and|&)\b/g, "")
+    .replace(/\b(llc|inc|corp|co|ltd|dba|the|and|&|lp|llp|pllc|pa|na|nv|group|services|solutions|company|enterprises|management|associates|consulting)\b/g, "")
     .replace(/[^a-z0-9\s]/g, "")
     .replace(/\s+/g, " ")
     .trim();
@@ -139,21 +139,44 @@ function lookupSBA(businessName, state) {
   if (!sbaIndex) return null;
   const key = normalizeName(businessName);
   if (!key) return null;
+
+  // 1. Exact normalized match
   let matches = sbaIndex[key] || [];
-  if (matches.length === 0) {
-    const words = key.split(" ").filter(w => w.length > 3);
-    if (words.length > 0) {
-      for (const [k, records] of Object.entries(sbaIndex)) {
-        if (words.every(w => k.includes(w))) {
-          matches = [...matches, ...records];
-          if (matches.length > 5) break;
-        }
+
+  // 2. Partial key match — search key starts with or contains our key
+  if (matches.length === 0 && key.length > 4) {
+    for (const [k, records] of Object.entries(sbaIndex)) {
+      if (k.startsWith(key) || key.startsWith(k)) {
+        matches = [...matches, ...records];
+        if (matches.length > 10) break;
       }
     }
   }
+
+  // 3. Scored word match — rank by how many significant words overlap
+  if (matches.length === 0) {
+    const words = key.split(" ").filter(w => w.length > 3);
+    if (words.length > 0) {
+      const scored = [];
+      for (const [k, records] of Object.entries(sbaIndex)) {
+        const matchCount = words.filter(w => k.includes(w)).length;
+        if (matchCount >= Math.max(1, Math.ceil(words.length * 0.5))) {
+          scored.push({ score: matchCount, records });
+        }
+      }
+      // Sort by score descending, take best matches
+      scored.sort((a, b) => b.score - a.score);
+      for (const { records } of scored.slice(0, 5)) {
+        matches = [...matches, ...records];
+      }
+    }
+  }
+
   if (matches.length === 0) return null;
-  const stateMatch = matches.find(r => r.state === state);
-  return stateMatch || matches[0];
+  // Prefer state match, then highest loan amount
+  const stateMatches = matches.filter(r => r.state === state);
+  const pool = stateMatches.length > 0 ? stateMatches : matches;
+  return pool.sort((a, b) => b.amount - a.amount)[0];
 }
 
 // ─── POSTGRES ────────────────────────────────────────────────────
