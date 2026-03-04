@@ -556,7 +556,10 @@ const server = http.createServer(async (req, res) => {
           const pageParam = pageToken ? `&pagetoken=${pageToken}` : '';
           if (page > 0) await new Promise(r => setTimeout(r, 2200));
           const placesData = await googleGet(`/maps/api/place/textsearch/json?query=${enc(type)}&location=${lat},${lng}&radius=50000&key=${GOOGLE_API_KEY}${pageParam}`);
-          const results = placesData.results || [];
+          const results = (placesData.results || []).filter(p => {
+            const addr = (p.formatted_address || '').toUpperCase();
+            return addr.includes(', USA') || addr.endsWith(' USA');
+          });
           allPlaces = allPlaces.concat(results);
           pageToken = placesData.next_page_token || null;
           if (!pageToken) break;
@@ -1187,7 +1190,7 @@ async function hereSearch(term, lat, lng, limit) {
   if (!HERE_API_KEY) return [];
   try {
     const q = encodeURIComponent(term);
-    const url = `https://discover.search.hereapi.com/v1/discover?at=${lat},${lng}&q=${q}&limit=${Math.min(limit, 100)}&apiKey=${HERE_API_KEY}`;
+    const url = `https://discover.search.hereapi.com/v1/discover?at=${lat},${lng}&q=${q}&limit=${Math.min(limit, 100)}&in=countryCode%3AUSA&apiKey=${HERE_API_KEY}`;
     const raw = await fetchURL(url, 6000);
     const data = JSON.parse(raw);
     return (data.items || []).map(item => ({
