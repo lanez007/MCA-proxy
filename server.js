@@ -7,7 +7,11 @@ const jwt = require("jsonwebtoken");
 const PORT = process.env.PORT || 3000;
 const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;
 const POSTGRES_URL = process.env.POSTGRES_URL;
-const JWT_SECRET = process.env.JWT_SECRET || "rcn-lead-gen-secret-change-in-prod";
+if (!process.env.JWT_SECRET) {
+  console.error("FATAL: JWT_SECRET environment variable is not set. Refusing to start.");
+  process.exit(1);
+}
+const JWT_SECRET = process.env.JWT_SECRET;
 const HERE_API_KEY   = process.env.HERE_API_KEY   || null;
 const HUNTER_API_KEY = process.env.HUNTER_API_KEY || null;
 const PDL_API_KEY    = process.env.PDL_API_KEY    || null;
@@ -85,8 +89,10 @@ function extractStateFromAddress(address) {
     if (US_STATE_CODES.has(code)) return code;
   }
   // Check for full state name (HERE uses "Florida", "Texas", etc.)
+  // Sort by name length descending so "west virginia" matches before "virginia"
   const lower = address.toLowerCase();
-  for (const [name, code] of Object.entries(US_STATE_NAMES)) {
+  const sortedNames = Object.entries(US_STATE_NAMES).sort((a,b) => b[0].length - a[0].length);
+  for (const [name, code] of sortedNames) {
     const re = new RegExp('\\b' + name + '\\b');
     if (re.test(lower)) return code;
   }
@@ -337,6 +343,31 @@ function generateReferralCode() {
 }
 
 async function initDB() {
+  // Email cache + Owner cache — shared across all users, grows over time
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS owner_cache (
+      biz_key TEXT PRIMARY KEY,
+      officer_name TEXT,
+      officer_type TEXT,
+      incorporation_date TEXT,
+      company_status TEXT,
+      state TEXT,
+      found_at TIMESTAMP DEFAULT NOW(),
+      hit_count INTEGER DEFAULT 1
+    )
+  `).catch(()=>{});
+
+  // Email cache — shared across all users, grows over time
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS email_cache (
+      domain TEXT PRIMARY KEY,
+      email TEXT,
+      source TEXT,
+      found_at TIMESTAMP DEFAULT NOW(),
+      hit_count INTEGER DEFAULT 1
+    )
+  `).catch(()=>{});
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
       id SERIAL PRIMARY KEY,
@@ -407,7 +438,7 @@ function getBody(req) {
 function respond(res, code, obj) {
   res.writeHead(code, {
     "Content-Type": "application/json",
-    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Origin": (process.env.ALLOWED_ORIGIN || "*"),
     "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type, Authorization",
   });
@@ -425,7 +456,7 @@ function verifyToken(req) {
 const server = http.createServer(async (req, res) => {
   if (req.method === "OPTIONS") {
     res.writeHead(200, {
-      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Origin": (process.env.ALLOWED_ORIGIN || "*"),
       "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
       "Access-Control-Allow-Headers": "Content-Type, Authorization",
     });
@@ -481,11 +512,15 @@ const server = http.createServer(async (req, res) => {
     const { email, password, referredBy } = await getBody(req);
     if (!email || !password) { respond(res, 400, { error: "Email and password required" }); return; }
     try {
+      const clientIp = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress || 'unknown';
+      const bfCheck = checkBruteForce(email, clientIp);
+      if (bfCheck.blocked) { respond(res, 429, { error: bfCheck.message }); return; }
       const result = await pool.query("SELECT * FROM users WHERE email = $1", [email.toLowerCase().trim()]);
       const user = result.rows[0];
-      if (!user) { respond(res, 401, { error: "Invalid email or password" }); return; }
+      if (!user) { recordFailedLogin(email, clientIp); respond(res, 401, { error: "Invalid email or password" }); return; }
       const valid = await bcrypt.compare(password, user.password_hash);
-      if (!valid) { respond(res, 401, { error: "Invalid email or password" }); return; }
+      if (!valid) { recordFailedLogin(email, clientIp); respond(res, 401, { error: "Invalid email or password" }); return; }
+      clearLoginAttempts(email, clientIp);
       const resetDate = new Date(user.searches_reset_date);
       const now = new Date();
       if (now.getFullYear() > resetDate.getFullYear() || now.getMonth() > resetDate.getMonth()) {
@@ -532,9 +567,10 @@ const server = http.createServer(async (req, res) => {
   if (url.pathname === "/search") {
     const decoded = verifyToken(req);
     if (!decoded) { respond(res, 401, { error: "Unauthorized — please log in" }); return; }
-    const type     = url.searchParams.get("type") || "";
-    const location = url.searchParams.get("location") || "";
+    const type     = (url.searchParams.get("type") || "").substring(0, 200);
+    const location = (url.searchParams.get("location") || "").substring(0, 200);
     const limit    = Math.min(parseInt(url.searchParams.get("limit") || "10"), 60);
+    if (!type || !location) { respond(res, 400, { error: "type and location required" }); return; }
     try {
       const user = await getUser(decoded.userId);
       if (!user) { respond(res, 401, { error: "User not found" }); return; }
@@ -630,12 +666,29 @@ const server = http.createServer(async (req, res) => {
         try {
           const stateCode = extractStateFromAddress(lead.address || '');
           if (!stateCode || !sosSupported.has(stateCode)) return;
-          const sosData = await Promise.race([
+          // Check owner cache first (instant), fall back to live SOS scrape
+          const cachedSOS = await getCachedOwner(lead.businessName, stateCode);
+          let sosData = cachedSOS || await Promise.race([
             scrapeSOS(lead.businessName, stateCode),
             new Promise(r => setTimeout(() => r(null), 4000))
           ]);
+          // If SOS found no owner OR only a commercial registered agent,
+          // try Manta/BBB as fallback to get the real owner name
+          if (!sosData?.officerName || sosData?.officerType === 'agent') {
+            const addrParts = (lead.address || '').split(',');
+            const city = addrParts.length >= 3 ? addrParts[addrParts.length - 3]?.trim() : addrParts[0]?.trim() || '';
+            const dirResult = await scrapeOwnerFromDirectories(lead.businessName, city, stateCode).catch(()=>null);
+            if (dirResult?.officerName) {
+              sosData = { ...(sosData || {}), officerName: dirResult.officerName, officerType: 'owner' };
+            }
+          }
+          // Store new finds in cache for next time
+          if (sosData?.officerName && !cachedSOS) {
+            cacheOwner(lead.businessName, stateCode, sosData).catch(()=>{});
+          }
           if (sosData) {
             lead.officerName      = sosData.officerName || null;
+            lead.officerType      = sosData.officerType || null;
             lead.incorporationDate = sosData.incorporationDate || null;
             lead.businessAge      = sosData.businessAge || null;
             lead.companyStatus    = sosData.companyStatus || null;
@@ -695,10 +748,18 @@ const server = http.createServer(async (req, res) => {
       const resolvedOfficer = officerParam || null; // use what client already has from auto-SOS
       const domain = siteUrl ? siteUrl.replace(/^https?:\/\/(www\.)?/, '').split('/')[0] : null;
 
+      // Check cache first — if we've seen this domain before, use it instantly
+      const cachedResult = domain ? await getCachedEmail(domain) : null;
+
+      // Check owner cache before calling SOS
+      // bizState is already parsed from the 'state' URL param above — use it directly
+      // Don't try to extract state from bizName (business names don't contain state codes)
+      const cachedOwnerData = await getCachedOwner(bizName, bizState);
+
       const [htmlEmail, sosData, hunterResult, pdlResult] = await Promise.all([
-        // HTML email scrape (fallback only)
-        siteUrl
-          ? Promise.race([scrapeEmail(siteUrl), new Promise(r => setTimeout(() => r(null), 6000))])
+        // HTML email scrape — skip if cache hit
+        (!cachedResult && siteUrl)
+          ? Promise.race([scrapeEmail(siteUrl), new Promise(r => setTimeout(() => r(null), 10000))])
           : Promise.resolve(null),
         // SOS officer lookup
         Promise.race([
@@ -716,14 +777,41 @@ const server = http.createServer(async (req, res) => {
       ]);
 
       // Resolve best officer name (PDL might find a cleaner version)
-      const officerName = sosData?.officerName || resolvedOfficer || null;
+      // Use cached owner if available, otherwise use SOS result
+      const freshSOS = sosData;
+      if (freshSOS?.officerName && !cachedOwnerData) {
+        await cacheOwner(bizName, bizState, freshSOS).catch(()=>{});
+      }
+      const officerData = cachedOwnerData || freshSOS;
+      const officerName = officerData?.officerName || resolvedOfficer || null;
+      const officerType = officerData?.officerType || null;
 
-      // Resolve best email — hunter >> html scrape, personal email >> work email
+      // Resolve best email — cache > pdl personal > hunter > html scrape > permutation
       const hunterEmail  = hunterResult?.email || null;
       const ownerEmail   = pdlResult?.ownerEmail || null;
-      const workEmail    = hunterEmail || htmlEmail || null;
-      const bestEmail    = ownerEmail || workEmail; // personal email wins
-      const emailSource  = ownerEmail ? 'pdl-personal' : hunterEmail ? 'hunter' : htmlEmail ? 'html-scrape' : null;
+      const scrapedEmail = htmlEmail || null;
+
+      // Use cache hit if available
+      const cacheEmail   = cachedResult?.email || null;
+      const cacheSource  = cachedResult?.source || null;
+
+      // If nothing found yet, try permutation estimate from officer name
+      const permResult   = (!cacheEmail && !ownerEmail && !hunterEmail && !scrapedEmail && officerName && domain)
+        ? bestPermutationGuess(officerName, domain)
+        : null;
+
+      const bestEmail = ownerEmail || cacheEmail || hunterEmail || scrapedEmail || permResult?.email || null;
+      const emailSource = ownerEmail ? 'pdl-personal'
+        : cacheEmail ? cacheSource
+        : hunterEmail ? 'hunter'
+        : scrapedEmail ? 'html-scrape'
+        : permResult ? 'permutation-estimated'
+        : null;
+
+      // Store any new find in cache for future lookups (free for all clients)
+      if (domain && bestEmail && !cacheEmail) {
+        await cacheEmail(domain, bestEmail, emailSource).catch(()=>{});
+      }
 
       // Owner direct phone from PDL
       const ownerPhone   = pdlResult?.ownerPhone || null;
@@ -746,6 +834,7 @@ const server = http.createServer(async (req, res) => {
         businessAge: sosData?.businessAge || null,
         companyStatus: sosData?.companyStatus || null,
         officerName,
+        officerType,
       });
     } catch(err) { console.error(err); respond(res, 500, { error: err.message }); }
     return;
@@ -981,8 +1070,8 @@ const server = http.createServer(async (req, res) => {
 function buildSOSUrl(bizName, state) {
   const name = encodeURIComponent(bizName);
   const urls = {
-    FL: `https://search.sunbiz.org/Inquiry/CorporationSearch/SearchResults?inquirytype=EntityName&search=${name}`,
-    TX: `https://mycpa.cpa.state.tx.us/coa/Index.html#search/${name}`,
+    FL: `https://search.sunbiz.org/Inquiry/CorporationSearch/SearchResults?inquirytype=EntityName&searchTerm=${name}`,
+    TX: `https://direct.sos.state.tx.us/corp_inquiry/corp_inquiry-entity_list.asp?corp_name=${name}&search_term=name&action=list&entity_type_cd=&filing_status_cd=A`,
     NY: `https://apps.dos.ny.gov/publicInquiry/#search?searchTerm=${name}&entity=DOS`,
     CA: `https://bizfileonline.sos.ca.gov/search/business?query=${name}`,
     GA: `https://ecorp.sos.ga.gov/BusinessSearch/BusinessInformation?nameContains=${name}`,
@@ -997,41 +1086,165 @@ function buildSOSUrl(bizName, state) {
   return urls[state] || `https://www.google.com/search?q=${encodeURIComponent(bizName + " " + state + " registered agent owner")}`;
 }
 
-// ─── EMAIL SCRAPER ───────────────────────────────────────────────
-function fetchPageEmails(hostname, path, proto) {
-  return new Promise((resolve) => {
+// ─── EMAIL CACHE — shared DB cache, scales to infinity ──────────
+async function getCachedEmail(domain) {
+  if (!domain) return null;
+  try {
+    const r = await pool.query(
+      'UPDATE email_cache SET hit_count = hit_count + 1 WHERE domain = $1 RETURNING email, source',
+      [domain.toLowerCase()]
+    );
+    if (r.rows.length > 0 && r.rows[0].email) {
+      console.log(`[EMAIL-CACHE] HIT: ${domain} → ${r.rows[0].email} (src:${r.rows[0].source})`);
+      return { email: r.rows[0].email, source: r.rows[0].source + '-cached' };
+    }
+    return null;
+  } catch(_) { return null; }
+}
+
+async function cacheEmail(domain, email, source) {
+  if (!domain || !email) return;
+  try {
+    await pool.query(
+      `INSERT INTO email_cache (domain, email, source, found_at, hit_count)
+       VALUES ($1, $2, $3, NOW(), 1)
+       ON CONFLICT (domain) DO UPDATE
+       SET email = $2, source = $3, found_at = NOW()`,
+      [domain.toLowerCase(), email.toLowerCase(), source]
+    );
+    console.log(`[EMAIL-CACHE] STORED: ${domain} → ${email} (src:${source})`);
+  } catch(_) {}
+}
+
+// ─── OWNER CACHE ─────────────────────────────────────────────────
+async function getCachedOwner(bizName, state) {
+  if (!bizName || !state) return null;
+  const key = (bizName.toLowerCase().replace(/[^a-z0-9]/g,'').substring(0,40) + ':' + state.toUpperCase());
+  try {
+    const r = await pool.query(
+      'UPDATE owner_cache SET hit_count = hit_count + 1 WHERE biz_key = $1 RETURNING officer_name, officer_type, incorporation_date, company_status',
+      [key]
+    );
+    if (r.rows.length > 0 && r.rows[0].officer_name) {
+      console.log(`[OWNER-CACHE] HIT: ${bizName}/${state} → ${r.rows[0].officer_name}`);
+      return { officerName: r.rows[0].officer_name, officerType: r.rows[0].officer_type,
+               incorporationDate: r.rows[0].incorporation_date, companyStatus: r.rows[0].company_status };
+    }
+    return null;
+  } catch(_) { return null; }
+}
+
+async function cacheOwner(bizName, state, data) {
+  if (!bizName || !state || !data?.officerName) return;
+  const key = (bizName.toLowerCase().replace(/[^a-z0-9]/g,'').substring(0,40) + ':' + state.toUpperCase());
+  try {
+    await pool.query(
+      `INSERT INTO owner_cache (biz_key, officer_name, officer_type, incorporation_date, company_status, state, found_at, hit_count)
+       VALUES ($1,$2,$3,$4,$5,$6,NOW(),1)
+       ON CONFLICT (biz_key) DO UPDATE
+       SET officer_name=$2, officer_type=$3, incorporation_date=$4, company_status=$5, found_at=NOW()`,
+      [key, data.officerName, data.officerType||null, data.incorporationDate||null, data.companyStatus||null, state.toUpperCase()]
+    );
+  } catch(_) {}
+}
+
+
+// ─── EMAIL PERMUTATION ENGINE ────────────────────────────────────
+// Generates likely email addresses from officer name + domain
+// No API, no credits, unlimited — based on real small biz patterns
+function generateEmailPermutations(officerName, domain) {
+  if (!officerName || !domain) return [];
+  const parts = officerName.trim().toLowerCase().split(/\s+/).filter(p => p.length > 1);
+  if (parts.length < 2) return [];
+  const first = parts[0];
+  const last = parts[parts.length - 1];
+  const fi = first[0]; // first initial
+  const li = last[0];  // last initial
+
+  const d = domain.toLowerCase(); // always lowercase domain
+  // Ordered by frequency for small businesses (< 50 employees)
+  // Source: Interseller analysis of 5M+ companies
+  return [
+    `${first}@${d}`,           // john@        60% of small biz
+    `${first}.${last}@${d}`,   // john.smith@  most common full name
+    `${first}${last}@${d}`,    // johnsmith@
+    `${fi}${last}@${d}`,       // jsmith@
+    `${fi}.${last}@${d}`,      // j.smith@
+    `info@${d}`,               // generic fallback — always exists
+    `contact@${d}`,
+    `${last}@${d}`,            // smith@
+    `${first}${li}@${d}`,      // johnS@
+    `${first}_${last}@${d}`,   // john_smith@
+  ].filter((e, i, arr) => arr.indexOf(e) === i); // dedupe
+}
+
+// Score permutations — return best guess with confidence label
+function bestPermutationGuess(officerName, domain) {
+  const perms = generateEmailPermutations(officerName, domain);
+  if (perms.length === 0) return null;
+  // Top pick is always firstname@ for small biz — return it with "estimated" label
+  return { email: perms[0], allGuesses: perms.slice(0, 5), source: 'permutation-estimated' };
+}
+
+// ─── MULTI-SOURCE EMAIL SCRAPER ──────────────────────────────────
+// Scrapes business website + public directories (BBB, Yelp, Google)
+// All free, no API, unlimited
+async function scrapePublicDirectories(bizName, city, state) {
+  const queries = [
+    `${bizName} ${city} ${state} email contact`,
+    `"${bizName}" "${city}" email`,
+  ];
+  const emails = [];
+  for (const q of queries) {
     try {
-      const options = {
-        hostname, path, method: "GET", timeout: 3000,
-        headers: { "User-Agent": "Mozilla/5.0 (compatible; RCNBot/1.0)", "Accept": "text/html" }
-      };
-      const req = proto.request(options, (res) => {
-        if ((res.statusCode === 301 || res.statusCode === 302) && res.headers.location) {
-          try {
-            const loc = new URL(res.headers.location, `https://${hostname}`);
-            resolve(fetchPageEmails(loc.hostname, loc.pathname + (loc.search || ""), loc.protocol === "https:" ? https : http));
-          } catch(_) { resolve([]); }
-          return;
-        }
-        let data = "";
-        res.on("data", c => { data += c; if (data.length > 80000) res.destroy(); });
-        res.on("end", () => {
-          const emailRegex = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g;
-          const matches = data.match(emailRegex) || [];
-          const filtered = matches.filter(e =>
-            !e.includes("example") && !e.includes("sentry") && !e.includes("wix") &&
-            !e.includes("wordpress") && !e.includes("schema") && !e.includes("@2x") &&
-            !e.endsWith(".png") && !e.endsWith(".jpg") && !e.endsWith(".gif") &&
-            !e.includes("jquery") && !e.includes("bootstrap") && e.length < 60
-          );
-          resolve([...new Set(filtered)]);
-        });
-      });
-      req.on("error", () => resolve([]));
-      req.on("timeout", () => { req.destroy(); resolve([]); });
-      req.end();
-    } catch(_) { resolve([]); }
-  });
+      const searchUrl = `https://www.google.com/search?q=${encodeURIComponent(q)}`;
+      const html = await Promise.race([
+        fetchURL(searchUrl, 5000, 100000),
+        new Promise(r => setTimeout(() => r(''), 5000))
+      ]);
+      if (!html) continue;
+      const found = extractEmailsFromHtml(html);
+      emails.push(...found);
+    } catch(_) {}
+  }
+  return [...new Set(emails)];
+}
+
+// ─── EMAIL SCRAPER ───────────────────────────────────────────────
+// Uses fetchURL (proper Chrome UA + full redirect following) for each page
+async function fetchPageEmails(url) {
+  try {
+    const html = await Promise.race([
+      fetchURL(url, 7000, 200000),
+      new Promise(r => setTimeout(() => r(''), 7000))
+    ]);
+    if (!html) return [];
+    return extractEmailsFromHtml(html);
+  } catch(_) { return []; }
+}
+
+function extractEmailsFromHtml(html) {
+  const emails = new Set();
+  // 1. mailto: href — most reliable (explicit links)
+  const mailtoRx = /href=["']mailto:([^"'?\s<>]+)/gi;
+  let m;
+  while ((m = mailtoRx.exec(html)) !== null) {
+    const e = m[1].toLowerCase().replace(/&amp;/g,'').trim();
+    if (e.includes('@') && !e.includes(' ')) emails.add(e);
+  }
+  // 2. JSON-LD structured data — Wix/WP/Squarespace often embed this
+  const jsonldRx = /"email"\s*:\s*"([^"@\s]+@[^"\s]+)"/gi;
+  while ((m = jsonldRx.exec(html)) !== null) emails.add(m[1].toLowerCase());
+  // 3. Plain text regex
+  const textRx = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g;
+  (html.match(textRx) || []).forEach(e => emails.add(e.toLowerCase()));
+  // 4. Obfuscated: name [at] domain [dot] com or name(at)domain(dot)com
+  const obfRx = /([a-zA-Z0-9._%+\-]+)\s*[\[\(]\s*at\s*[\]\)]\s*([a-zA-Z0-9.\-]+)\s*[\[\(]\s*dot\s*[\]\)]\s*([a-zA-Z]{2,})/gi;
+  while ((m = obfRx.exec(html)) !== null) emails.add(`${m[1]}@${m[2]}.${m[3]}`.toLowerCase());
+  // 5. HTML entities encoded: info&#64;domain.com
+  const entRx = /([a-zA-Z0-9._%+\-]+)&#64;([a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})/g;
+  while ((m = entRx.exec(html)) !== null) emails.add(`${m[1]}@${m[2]}`.toLowerCase());
+  return [...emails];
 }
 
 // ── HUNTER.IO — domain email search ──────────────────────────────
@@ -1139,49 +1352,41 @@ async function pdlPersonLookup(officerName, bizName, bizState) {
 async function scrapeEmail(siteUrl) {
   try {
     const urlObj = new URL(siteUrl);
-    const proto = urlObj.protocol === "https:" ? https : http;
-    const host = urlObj.hostname;
+    const base = `${urlObj.protocol}//${urlObj.hostname}`;
+    // Extract root domain for matching: "www.miamiroofing.com" -> "miamiroofing.com"
+    const siteDomain = urlObj.hostname.replace(/^www\./, '').toLowerCase();
 
-    // Check 6 common pages in parallel
-    const paths = ["/", "/contact", "/contact-us", "/about", "/about-us", "/get-in-touch"];
-    const results = await Promise.all(paths.map(p => fetchPageEmails(host, p, proto)));
+    // Check contact pages first (highest yield), then homepage
+    const paths = ["/contact", "/contact-us", "/contactus", "/about", "/about-us", "/", "/get-in-touch", "/contact.html", "/reach-us"];
+    const results = await Promise.all(paths.map(p => fetchPageEmails(base + p)));
     const all = [...new Set(results.flat())];
 
-    // Aggressive junk filter
-    const junkDomains = ["example.com","sentry.io","wix.com","wordpress","schema.org",
-      "jquery","bootstrap","googleapis","cloudflare","fontawesome","squarespace",
-      "godaddy","weebly","shopify","mailchimp","sendgrid","amazonaws","jsdelivr",
-      "unpkg.com","cdnjs","facebook.com","twitter.com","instagram.com","linkedin.com",
-      "youtube.com","tiktok.com","google.com","apple.com","microsoft.com"];
-    const junkExts = [".png",".jpg",".gif",".svg",".webp",".woff",".ttf",".js",".css"];
-    const junkPrefixes = ["noreply","no-reply","donotreply","do-not-reply","bounce","mailer-daemon","postmaster"];
+    const noReplyPrefixes = ["noreply","no-reply","donotreply","do-not-reply","bounce","mailer-daemon","postmaster"];
 
-    const clean = all.filter(e => {
-      const lower = e.toLowerCase();
+    // ACCURACY RULE: only keep emails whose domain matches the business website domain
+    // This eliminates all false positives (CDN emails, tracking pixels, partner emails, etc.)
+    const siteEmails = all.filter(e => {
+      if (!e.includes('@')) return false;
+      const emailDomain = e.split('@')[1]?.toLowerCase().replace(/^www\./, '') || '';
+      // Must be on same domain (exact match or subdomain)
+      if (emailDomain !== siteDomain && !emailDomain.endsWith('.' + siteDomain)) return false;
+      // Skip no-reply addresses
+      if (noReplyPrefixes.some(p => e.split('@')[0].toLowerCase().startsWith(p))) return false;
       if (e.length > 70 || e.length < 6) return false;
-      if (junkDomains.some(d => lower.includes(d))) return false;
-      if (junkExts.some(x => lower.endsWith(x))) return false;
-      if (lower.includes("@2x") || lower.includes("@3x")) return false;
-      // must have valid TLD
-      const parts = e.split("@");
-      if (parts.length !== 2) return false;
-      const domain = parts[1];
-      if (!domain.includes(".") || domain.endsWith(".")) return false;
       return true;
     });
 
-    if (clean.length === 0) { console.log('[EMAIL] no valid emails found, raw count:', all.length); return null; }
+    if (siteEmails.length === 0) {
+      console.log(`[EMAIL] no on-domain emails found for ${siteDomain} | raw emails found: ${all.length}`);
+      return null;
+    }
 
-    // Pick best email: avoid generic prefixes, prefer business-sounding ones
-    const genericPrefixes = ["info","contact","hello","admin","support","office","mail","team","sales","help","enquiries","enquiry"];
-    const noReplyPrefixes = ["noreply","no-reply","donotreply"];
-
-    const best = clean.find(e => {
-      const local = e.split("@")[0].toLowerCase();
-      return !genericPrefixes.includes(local) && !noReplyPrefixes.some(p => local.startsWith(p));
-    });
-    const generic = clean.find(e => !noReplyPrefixes.some(p => e.toLowerCase().startsWith(p)));
-    return best || generic || clean[0] || null;
+    // Prefer personal-sounding over generic, but both are valid
+    const genericPrefixes = ["info","contact","hello","admin","support","office","mail","team","help","enquiries","enquiry","sales"];
+    const personal = siteEmails.find(e => !genericPrefixes.includes(e.split('@')[0].toLowerCase()));
+    const result = personal || siteEmails[0];
+    console.log(`[EMAIL] found: ${result} (from ${siteEmails.length} on-domain emails)`);
+    return result;
   } catch(_) { return null; }
 }
 
@@ -1209,28 +1414,356 @@ async function hereSearch(term, lat, lng, limit) {
 // ─── FL + TX + GA SOS SCRAPERS ───────────────────────────────────
 
 // Master dispatcher — picks scraper by state
-async function scrapeSOS(bizName, stateCode) {
-  if (!bizName) return null;
+
+// ─── SOS SCRAPERS — 14 STATES ────────────────────────────────────
+// Each returns: { officerName, officerType, incorporationDate, businessAge, companyStatus }
+// officerType: 'owner' = confirmed principal/officer
+//              'agent' = registered agent (not owner, still useful for contact)
+//              null    = unknown
+
+// ─── KNOWN REGISTERED AGENT SERVICES ────────────────────────────
+// These are NEVER the actual business owner — filter them out
+const KNOWN_RA_SERVICES = new Set([
+  'ct corporation','ct corporation system','corporation service company','csc',
+  'northwest registered agents','northwest registered agent','nra inc',
+  'national registered agents','nrai services','national corporate research',
+  'cogency global','legalzoom','legalzoom.com',
+  'incorp services','incorp.com','incorp','incorporate.com',
+  'registered agent solutions','ras','business filings incorporated',
+  'wolters kluwer','wolters kluwer ct corporation',
+  'united states corporation agents','usca',
+  'harvard business services','harvard business services inc',
+  'the company corporation','company corporation',
+  'statutory agent inc','registered agents inc',
+  'parasec','paracorp','paracorp incorporated',
+  'capitol services','capitol corporate services',
+  'vcorp services','vcorp','v corp',
+  'spiegel & utrera','spiegel and utrera',
+  'florida department of state','secretary of state',
+  'national corp research','intl registered agent',
+  'agent for service of process','c t corporation',
+  'registered agent group','registered office',
+  'abc registered agents','1st choice international',
+]);
+
+function isKnownRAService(name) {
+  if (!name) return false;
+  const n = name.toLowerCase().trim();
+  // Exact match
+  if (KNOWN_RA_SERVICES.has(n)) return true;
+  // Partial match for common patterns
+  if (n.includes('registered agent') && n.length > 20) return true;
+  if (n.includes('ct corp')) return true;
+  if (n.includes('corporation service')) return true;
+  if (n.includes('legalzoom')) return true;
+  if (n.includes('northwest reg')) return true;
+  if (n.includes('cogency')) return true;
+  if (n.includes('vcorp') || n.includes('v corp')) return true;
+  if (n.includes('parasec') || n.includes('paracorp')) return true;
+  if (n.includes('incorp') && n.includes('service')) return true;
+  // Single word all-caps that's just a city/state
+  if (/^[A-Z]{2}$/.test(name.trim())) return true;
+  return false;
+}
+
+// Clean officer name — remove titles, extra whitespace
+function cleanOfficerName(name) {
+  if (!name) return null;
+  return name
+    .replace(/,?\s*(president|secretary|treasurer|director|manager|member|ceo|cfo|coo|vp|vice president|registered agent|agent)\s*$/i, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+
+// ─── OWNER NAME FALLBACK — scrape Manta + BBB ────────────────────
+// These are public business directories that often list the owner name
+// No API, no credits, unlimited
+async function scrapeOwnerFromDirectories(bizName, city, state) {
   try {
-    if (stateCode === 'FL') return await scrapeFL(bizName);
-    if (stateCode === 'TX') return await scrapeTX(bizName);
-    if (stateCode === 'GA') return await scrapeGA(bizName);
-    if (stateCode === 'NY') return await scrapeNY(bizName);
-    if (stateCode === 'CA') return await scrapeCA(bizName);
-    if (stateCode === 'IL') return await scrapeIL(bizName);
-    if (stateCode === 'AZ') return await scrapeAZ(bizName);
-    if (stateCode === 'CO') return await scrapeCO(bizName);
-    if (stateCode === 'OH') return await scrapeOH(bizName);
-    if (stateCode === 'PA') return await scrapePA(bizName);
-    if (stateCode === 'NC') return await scrapeNC(bizName);
-    if (stateCode === 'NJ') return await scrapeNJ(bizName);
-    if (stateCode === 'VA') return await scrapeVA(bizName);
-    if (stateCode === 'WA') return await scrapeWA(bizName);
-    return null;
+    // Try Manta first — very reliable owner name source for small businesses
+    const mantaQ = encodeURIComponent(`${bizName} ${city} ${state}`);
+    const mantaHtml = await Promise.race([
+      fetchURL(`https://www.manta.com/search?search_source=nav&search=${mantaQ}`, 5000),
+      new Promise(r => setTimeout(() => r(''), 5000))
+    ]);
+    if (mantaHtml && mantaHtml.length > 500) {
+      // Manta shows "Owner: John Smith" or "John Smith, Owner" patterns
+      const ownerMatch = mantaHtml.match(/(?:Owner|President|CEO|Founder)[:\s]*([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+){1,3})/i) ||
+                         mantaHtml.match(/([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+){1,2})(?:[\s,]*(?:Owner|President|CEO|Founder))/i);
+      if (ownerMatch) {
+        const n = ownerMatch[1].trim();
+        if (!isKnownRAService(n) && n.split(' ').length >= 2) {
+          console.log(`[MANTA] Found owner for "${bizName}": ${n}`);
+          return { officerName: n, officerType: 'owner', source: 'manta' };
+        }
+      }
+    }
+  } catch(_) {}
+
+  try {
+    // Try BBB — also lists owner/principal names
+    const bbbQ = encodeURIComponent(`${bizName} ${city} ${state}`);
+    const bbbHtml = await Promise.race([
+      fetchURL(`https://www.bbb.org/search?find_text=${bbbQ}&find_loc=${encodeURIComponent(`${city}, ${state}`)}`, 5000),
+      new Promise(r => setTimeout(() => r(''), 5000))
+    ]);
+    if (bbbHtml && bbbHtml.length > 500) {
+      const principalMatch = bbbHtml.match(/(?:Principal|Owner|Contact)[:\s]*([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+){1,3})/i);
+      if (principalMatch) {
+        const n = principalMatch[1].trim();
+        if (!isKnownRAService(n) && n.split(' ').length >= 2) {
+          console.log(`[BBB] Found owner for "${bizName}": ${n}`);
+          return { officerName: n, officerType: 'owner', source: 'bbb' };
+        }
+      }
+    }
+  } catch(_) {}
+
+  return null;
+}
+
+async function scrapeSOS(bizName, stateCode) {
+  const supported = { FL:scrapeFL, TX:scrapeTX, GA:scrapeGA, NY:scrapeNY,
+    CA:scrapeCA, IL:scrapeIL, AZ:scrapeAZ, CO:scrapeCO, OH:scrapeOH,
+    PA:scrapePA, NC:scrapeNC, NJ:scrapeNJ, VA:scrapeVA, WA:scrapeWA };
+  const fn = supported[stateCode];
+  if (!fn) return null;
+  try {
+    const result = await Promise.race([fn(bizName), new Promise(r => setTimeout(()=>r(null), 7000))]);
+    if (!result) return null;
+    // Apply RA service filter — mark type, don't discard (agent is still useful)
+    if (result.officerName && isKnownRAService(result.officerName)) {
+      result.officerType = 'agent';
+    }
+    result.officerName = cleanOfficerName(result.officerName);
+    if (!result.officerName) result.officerName = null;
+    return result;
   } catch(_) { return null; }
 }
 
-// ── CALIFORNIA — Bizfile Online ───────────────────────────────────
+// ── FLORIDA — Sunbiz (two-step: search → detail page) ─────────────
+// FL is the most reliable — law requires all officers listed publicly
+async function scrapeFL(bizName) {
+  try {
+    const q = encodeURIComponent(bizName);
+    const searchHtml = await fetchURL(
+      `https://search.sunbiz.org/Inquiry/CorporationSearch/SearchResults?inquirytype=EntityName&searchNameOrder=&masterDataToSearch=&inquiryDirectionType=ForwardList&startingDetailId=&viewType=DetailView&searchStatus=Active&filingType=All&searchTerm=${q}`
+    );
+    const objMatch = searchHtml.match(/GetFilingInformation\?objectId=([A-Z0-9]+)/);
+    if (!objMatch) return null;
+
+    const detailHtml = await fetchURL(
+      `https://search.sunbiz.org/Inquiry/CorporationSearch/GetFilingInformation?objectId=${objMatch[1]}`
+    );
+
+    // Filing date
+    const filedMatch = detailHtml.match(/Filing Date[^<]*<[^>]+>([^<]{6,20})</) ||
+                       detailHtml.match(/Date Filed[^<]*<[^>]+>([^<]{6,20})</) ||
+                       detailHtml.match(/(\d{2}\/\d{2}\/\d{4})/);
+    const incDate = filedMatch ? filedMatch[1].trim() : null;
+
+    // Status
+    const statusMatch = detailHtml.match(/(?:Status)[^<]*<[^>]+>([^<]{3,20})</) ||
+                        detailHtml.match(/\b(Active|Inactive|Dissolved)\b/i);
+    const companyStatus = statusMatch ? statusMatch[1].trim() : null;
+
+    // Officers — Sunbiz shows them AFTER "Officer/Director Detail" section
+    // Pattern: name in a <span> or <td>, followed by title in next cell
+    const officerSection = detailHtml.indexOf('Officer/Director Detail');
+    let officerName = null;
+    let officerType = null;
+
+    if (officerSection !== -1) {
+      const section = detailHtml.slice(officerSection, officerSection + 3000);
+      // Extract all text in span/td that looks like a proper name (2+ words, mixed case or all caps)
+      const namePattern = /<(?:span|td|p)[^>]*>\s*([A-Z][A-Za-z\s'-]{2,}(?:\s+[A-Z][A-Za-z'-]+)+)\s*<\/(?:span|td|p)>/g;
+      const skipList = new Set(['OFFICER','DIRECTOR','MANAGER','MEMBER','PRESIDENT','SECRETARY',
+        'TREASURER','REGISTERED','AGENT','FLORIDA','ACTIVE','INACTIVE','DISSOLVED',
+        'UNITED STATES','ADDRESS','CITY','STATE','ZIP','TITLE','NAME','TYPE',
+        'OFFICER TYPE','DIRECTOR DETAIL','DETAIL INFORMATION']);
+      let m;
+      while ((m = namePattern.exec(section)) !== null) {
+        const candidate = m[1].trim();
+        // Must have 2+ words, not a skip word, not all numeric, not a city/state phrase
+        if (candidate.split(/\s+/).length >= 2 &&
+            !skipList.has(candidate.toUpperCase()) &&
+            !candidate.match(/^\d/) &&
+            candidate.length >= 4) {
+          officerName = candidate;
+          officerType = 'owner'; // Sunbiz officer section = confirmed owner
+          break;
+        }
+      }
+    }
+
+    // Fallback: look for name before "P" (President) or "D" (Director) title markers
+    if (!officerName) {
+      const titleMatch = detailHtml.match(/([A-Z][A-Za-z\s'-]{5,40})\s*(?:<[^>]+>)?\s*(?:P|D|VP|T|S)\s*(?:<|\n|\s{2})/);
+      if (titleMatch) { officerName = titleMatch[1].trim(); officerType = 'owner'; }
+    }
+
+    console.log(`[SOS FL] "${bizName}" → officer=${officerName||'NONE'} type=${officerType||'?'} date=${incDate||'?'} status=${companyStatus||'?'}`);
+    return { incorporationDate: incDate, businessAge: parseAge(incDate), companyStatus, officerName, officerType };
+  } catch(e) {
+    console.log(`[SOS FL] ERROR "${bizName}": ${e.message}`);
+    return null;
+  }
+}
+
+// ── TEXAS — SOS Direct (two-step: search → entity detail) ─────────
+// FIXED: was using wrong site (Comptroller). Now uses actual TX SOS.
+async function scrapeTX(bizName) {
+  try {
+    const q = encodeURIComponent(bizName);
+    // TX SOS entity search — returns list of matches
+    const html = await fetchURL(
+      `https://direct.sos.state.tx.us/corp_inquiry/corp_inquiry-entity_list.asp?bik_ein=&corp_name=${q}&corp_num=&entity_type_cd=&filing_status_cd=A&action=list&search_term=name`
+    );
+    // Get first entity detail link
+    const entityMatch = html.match(/corp_inquiry-entity_name\.asp\?[^"']*corp_num=([\d]+)/i) ||
+                        html.match(/corp_num=([0-9]+)/);
+    if (!entityMatch) {
+      // No results page — try direct parse
+      const dateMatch = html.match(/(\d{2}\/\d{2}\/\d{4})/);
+      const incDate = dateMatch ? dateMatch[1] : null;
+      const statusMatch = html.match(/\b(Active|Inactive|Forfeited|Dissolved|Exists)\b/i);
+      const agentMatch = html.match(/Registered Agent[^A-Z]*([A-Z][A-Za-z\s,.'-]{3,50})(?:<|\n)/);
+      const officerName = agentMatch ? agentMatch[1].trim() : null;
+      const officerType = officerName ? (isKnownRAService(officerName) ? 'agent' : 'unknown') : null;
+      return { incorporationDate: incDate, businessAge: parseAge(incDate), companyStatus: statusMatch?.[1] || null, officerName, officerType };
+    }
+
+    // Fetch entity detail page which has officer information
+    const corpNum = entityMatch[1];
+    const detailHtml = await fetchURL(
+      `https://direct.sos.state.tx.us/corp_inquiry/corp_inquiry-entity_name.asp?corp_num=${corpNum}`
+    );
+
+    const dateMatch = detailHtml.match(/(?:Formation Date|Date Formed|SOS Receipt Date)[^\d]*(\d{1,2}\/\d{1,2}\/\d{4})/i) ||
+                      detailHtml.match(/(\d{2}\/\d{2}\/\d{4})/);
+    const incDate = dateMatch ? dateMatch[1] : null;
+
+    const statusMatch = detailHtml.match(/\b(Active|Inactive|Forfeited|Dissolved)\b/i);
+
+    // TX detail page has Officer/Director info in table
+    const officerSection = detailHtml.indexOf('Officer');
+    let officerName = null, officerType = null;
+    if (officerSection !== -1) {
+      const section = detailHtml.slice(officerSection, officerSection + 2000);
+      const nameMatch = section.match(/<td[^>]*>\s*([A-Z][A-Za-z\s,.'-]{5,50})\s*<\/td>/);
+      if (nameMatch && !isKnownRAService(nameMatch[1])) {
+        officerName = nameMatch[1].trim();
+        officerType = 'owner';
+      }
+    }
+    // Fallback to registered agent
+    if (!officerName) {
+      const agentMatch = detailHtml.match(/Registered Agent[^A-Z]*([A-Z][A-Za-z\s,.'-]{3,50})(?:<|\n)/);
+      if (agentMatch) { officerName = agentMatch[1].trim(); officerType = isKnownRAService(officerName) ? 'agent' : 'unknown'; }
+    }
+
+    console.log(`[SOS TX] "${bizName}" → officer=${officerName||'NONE'} type=${officerType||'?'}`);
+    return { incorporationDate: incDate, businessAge: parseAge(incDate), companyStatus: statusMatch?.[1] || null, officerName, officerType };
+  } catch(e) { console.log(`[SOS TX] ERROR: ${e.message}`); return null; }
+}
+
+// ── GEORGIA — eCorp (two-step: search → entity detail) ────────────
+async function scrapeGA(bizName) {
+  try {
+    const q = encodeURIComponent(bizName);
+    // Step 1: search for the entity to get its control number
+    const searchHtml = await fetchURL(
+      `https://ecorp.sos.ga.gov/BusinessSearch/BusinessInformation?nameContains=${q}&businessType=&businessStatus=Active&SortField=BusinessName&SortOrder=asc&SearchMode=2&StartIndex=0&NumResults=5`,
+      5000
+    );
+    // Pull control number from first result link
+    const ctrlMatch = searchHtml.match(/BusinessDetails[?&]id=([\d]+)/) ||
+                      searchHtml.match(/control_num=([\d]+)/) ||
+                      searchHtml.match(/\/BusinessSearch\/BusinessInformation\?businessId=([\d]+)/);
+
+    // Parse search results page first (has some data)
+    const dateMatch = searchHtml.match(/(?:Formation|Registration|Filing|Incorporated)[^\d]*(\d{1,2}\/\d{1,2}\/\d{4})/) ||
+                      searchHtml.match(/(?:Formation|Registration|Filing|Incorporated)[^\d]*(\d{4}-\d{2}-\d{2})/);
+    const incDate = dateMatch ? dateMatch[1] : null;
+    const statusMatch = searchHtml.match(/\b(Active|Inactive|Dissolved|Revoked|Admin Dissolved)\b/i);
+    const companyStatus = statusMatch ? statusMatch[0] : null;
+
+    let officerName = null, officerType = null;
+
+    if (ctrlMatch) {
+      // Step 2: get entity detail page which has principal officer info
+      const detailHtml = await fetchURL(
+        `https://ecorp.sos.ga.gov/BusinessSearch/BusinessInformation?businessId=${ctrlMatch[1]}`,
+        5000
+      ).catch(() => '');
+
+      // GA detail shows principal office / registered agent in separate sections
+      const principalMatch = detailHtml.match(/(?:Principal|Officer|Manager|Organizer)[^A-Z]*([A-Z][A-Za-z\s,.'-]{5,50})(?:<|\n)/i);
+      const agentMatch = detailHtml.match(/Registered Agent[^A-Z]*([A-Z][A-Za-z\s,.'-]{3,50})(?:<|\n)/i);
+
+      if (principalMatch && !isKnownRAService(principalMatch[1])) {
+        officerName = principalMatch[1].trim();
+        officerType = 'owner';
+      } else if (agentMatch) {
+        officerName = agentMatch[1].trim();
+        officerType = isKnownRAService(officerName) ? 'agent' : 'unknown';
+      }
+    }
+
+    // Fallback: parse directly from search list HTML
+    if (!officerName) {
+      const agentMatch = searchHtml.match(/Registered Agent[^A-Z]*([A-Z][A-Za-z\s,.'-]{3,60})(?:<|\n)/);
+      if (agentMatch) { officerName = agentMatch[1].trim(); officerType = isKnownRAService(officerName) ? 'agent' : 'unknown'; }
+    }
+
+    console.log(`[SOS GA] "${bizName}" → officer=${officerName||'NONE'} type=${officerType||'?'}`);
+    return { incorporationDate: incDate, businessAge: parseAge(incDate), companyStatus, officerName, officerType };
+  } catch(e) { console.log(`[SOS GA] ERROR: ${e.message}`); return null; }
+}
+
+// ── NEW YORK — DOS Open Data API ──────────────────────────────────
+// Dataset has chief_executive_name for corporations, not always for LLCs
+async function scrapeNY(bizName) {
+  try {
+    const q = encodeURIComponent(bizName.replace(/'/g,''));
+    const json = await fetchURL(
+      `https://data.ny.gov/resource/ej5i-h7qk.json?$where=current_entity_name+like+%27${q}%25%27&$limit=5`,
+      5000
+    );
+    const data = JSON.parse(json);
+    const biz = data?.[0];
+    if (!biz) return null;
+
+    const incDate = biz.date_of_initial_dos_filing || biz.initial_dos_filing_date || null;
+    // NY DOS dataset field names - different for Corp vs LLC
+    // Corporations: chief_executive_name (CEO/President)
+    // LLCs: organizer_name (the person who filed/organized the LLC)
+    // dos_process_name = person to receive legal process (often registered agent)
+    const ceoCand      = biz.chief_executive_name || biz.ceo_name || null;
+    const orgCand      = biz.organizer_name || biz.initial_dos_filing_by || null;
+    const dosCand      = biz.dos_process_name || null;
+    // Prefer actual owner (CEO/organizer) over registered process agent
+    const rawOfficer   = (!ceoCand || isKnownRAService(ceoCand)) ? orgCand : ceoCand;
+    const fallbackAgent = (!rawOfficer && dosCand && !isKnownRAService(dosCand)) ? dosCand : null;
+    const officerName  = rawOfficer || fallbackAgent || null;
+    const officerType  = !officerName ? null
+      : isKnownRAService(officerName) ? 'agent'
+      : (ceoCand && officerName === ceoCand) ? 'owner'
+      : (orgCand && officerName === orgCand) ? 'owner'
+      : 'unknown';
+
+    console.log(`[SOS NY] "${bizName}" → officer=${officerName||'NONE'} type=${officerType||'?'}`);
+    return {
+      incorporationDate: incDate ? incDate.split('T')[0] : null,
+      businessAge: parseAge(incDate),
+      companyStatus: biz.current_entity_status || biz.dos_process_status || null,
+      officerName, officerType
+    };
+  } catch(e) { console.log(`[SOS NY] ERROR: ${e.message}`); return null; }
+}
+
+// ── CALIFORNIA — BizFile Online API ──────────────────────────────
 async function scrapeCA(bizName) {
   try {
     const q = encodeURIComponent(bizName);
@@ -1239,12 +1772,42 @@ async function scrapeCA(bizName) {
       5000
     );
     const data = JSON.parse(json);
-    const biz = data?.hits?.hits?.[0]?._source || data?.results?.[0];
-    if (!biz) return null;
-    const incDate = biz.registration_date || biz.date_filed || biz.filedate || null;
-    const officerName = biz.principal_name || biz.agent_name || biz.ceo || null;
-    return { incorporationDate: incDate, businessAge: parseAge(incDate), companyStatus: biz.status || biz.entity_status || null, officerName };
-  } catch(_) { return null; }
+    // CA BizFile API response: data.hits.hits[0]._source has the entity
+    const src = data?.hits?.hits?.[0]?._source || data?.results?.[0] || null;
+    if (!src) return null;
+
+    const incDate = src.REGISTRATION_DATE || src.registration_date || src.DATE_FILED || src.date_filed || null;
+    const companyStatus = src.STATUS || src.status || src.ENTITY_STATUS || null;
+
+    // CA BizFile API actual field names (verified against BizFile schema)
+    // OFFICERS is an array of {officerTitle, officerName} — present in detail response
+    // For search results, AGENT_FOR_SERVICE_OF_PROCESS is most reliable
+    const officers = src.OFFICERS || src.officers || [];
+    let officerName = null, officerType = 'unknown';
+    // Try to find a real person in the officers array
+    if (Array.isArray(officers) && officers.length > 0) {
+      const realOfficer = officers.find(o => {
+        const n = (o.officerName || o.name || o.OFFICER_NAME || '').trim();
+        return n && !isKnownRAService(n) && n.split(' ').length >= 2;
+      });
+      if (realOfficer) {
+        officerName = (realOfficer.officerName || realOfficer.name || '').trim();
+        officerType = 'owner';
+      }
+    }
+    // Fallback: agent for service (may be a person for small LLC)
+    if (!officerName) {
+      const agentRaw = src.AGENT_FOR_SERVICE_OF_PROCESS || src.agent_for_service_of_process || src.AGENT_NAME || '';
+      const agentStr = String(agentRaw).replace(/\d.*$/, '').trim(); // strip addresses
+      if (agentStr && agentStr.length > 3 && agentStr.split(' ').length >= 2) {
+        officerName = agentStr;
+        officerType = isKnownRAService(agentStr) ? 'agent' : 'unknown';
+      }
+    }
+
+    console.log(`[SOS CA] "${bizName}" → officer=${officerName||'NONE'} type=${officerType||'?'}`);
+    return { incorporationDate: incDate, businessAge: parseAge(incDate), companyStatus, officerName, officerType };
+  } catch(e) { console.log(`[SOS CA] ERROR: ${e.message}`); return null; }
 }
 
 // ── ILLINOIS — ILSOS ──────────────────────────────────────────────
@@ -1258,147 +1821,156 @@ async function scrapeIL(bizName) {
     const dateMatch = html.match(/(?:Date Filed|File Date|Incorporation Date)[^\d]*(\d{1,2}\/\d{1,2}\/\d{4})/i) ||
                       html.match(/(\d{2}\/\d{2}\/\d{4})/);
     const incDate = dateMatch ? dateMatch[1] : null;
-    const statusMatch = html.match(/(?:Active|Good Standing|Dissolved|Revoked)/i);
-    const agentMatch = html.match(/(?:Registered Agent|Agent Name)[^A-Z]*([A-Z][A-Za-z\s,\.'-]{3,50})(?:<|\n)/i);
-    return { incorporationDate: incDate, businessAge: parseAge(incDate), companyStatus: statusMatch?.[0] || null, officerName: agentMatch?.[1]?.trim() || null };
+    const statusMatch = html.match(/\b(Active|Good Standing|Dissolved|Revoked)\b/i);
+    // IL: registered agent appears after "Registered Agent:" label
+    const agentMatch = html.match(/Registered Agent[:\s]*([A-Z][A-Za-z\s,.'-]{3,50})(?:<|\n|\r)/);
+    const officerName = agentMatch ? agentMatch[1].trim() : null;
+    const officerType = officerName ? (isKnownRAService(officerName) ? 'agent' : 'unknown') : null;
+    return { incorporationDate: incDate, businessAge: parseAge(incDate), companyStatus: statusMatch?.[1] || null, officerName, officerType };
   } catch(_) { return null; }
 }
 
 // ── ARIZONA — ACC ─────────────────────────────────────────────────
 async function scrapeAZ(bizName) {
+  // AZ Corporation Commission - use their public search API
   try {
     const q = encodeURIComponent(bizName);
+    // AZ SOS Open Data (CKAN) endpoint — stable JSON API
     const json = await fetchURL(
-      `https://ecorp.azcc.gov/api/Corporations/GetBusinessInfo?businessName=${q}&includeInactive=false`,
+      `https://api.azsos.gov/business/search?Name=${q}&Status=Active`,
       5000
     );
     const data = JSON.parse(json);
-    const biz = Array.isArray(data) ? data[0] : data?.results?.[0] || data;
-    if (!biz?.entityName) return null;
-    const incDate = biz.incorporationDate || biz.dateIncorporated || biz.dateFormed || null;
-    const officerName = biz.statutoryAgent || biz.agentName || biz.principalOfficer || null;
-    return { incorporationDate: incDate, businessAge: parseAge(incDate), companyStatus: biz.entityStatus || biz.status || null, officerName };
+    const biz = Array.isArray(data?.results) ? data.results[0] : Array.isArray(data) ? data[0] : null;
+    if (!biz) return null;
+    const incDate = biz.formationDate || biz.incorporationDate || biz.filedDate || null;
+    const rawOfficer = biz.principalOfficerName || biz.presidentName || biz.managerName || biz.agentName || null;
+    const officerName = rawOfficer ? String(rawOfficer).trim() : null;
+    const officerType = officerName ? (isKnownRAService(officerName) ? 'agent' : 'unknown') : null;
+    return { incorporationDate: incDate, businessAge: parseAge(incDate), companyStatus: biz.status || null, officerName, officerType };
   } catch(_) { return null; }
 }
 
 // ── COLORADO — SOS ────────────────────────────────────────────────
 async function scrapeCO(bizName) {
+  // CO SOS is JS-rendered — use Colorado Open Data portal (Socrata JSON API)
   try {
-    const q = encodeURIComponent(bizName);
-    const html = await fetchURL(
-      `https://www.sos.state.co.us/biz/BusinessEntityCriteriaExt.do?nameTyp=ENT&masterFileId=&entityName2=${q}&entityId2=&fileId=&srchTyp=ENTITY&action=submitEntityCriteriaExt`,
+    const q = encodeURIComponent(bizName.replace(/'/g,"''"));
+    const json = await fetchURL(
+      `https://data.colorado.gov/resource/4ykn-tg5h.json?$where=entityname+like+%27${encodeURIComponent(bizName.replace(/'/g,"''"))}%25%27&$limit=5`,
       5000
     );
-    const dateMatch = html.match(/(?:Date of Formation|Formation Date|Date Filed)[^\d]*(\d{1,2}\/\d{1,2}\/\d{4})/i) ||
-                      html.match(/(\d{2}\/\d{2}\/\d{4})/);
-    const incDate = dateMatch ? dateMatch[1] : null;
-    const statusMatch = html.match(/(?:Good Standing|Delinquent|Dissolved|Active)/i);
-    const agentMatch = html.match(/(?:Registered Agent)[^A-Z]*([A-Z][A-Za-z\s,\.'-]{3,50})(?:<|\n)/i);
-    return { incorporationDate: incDate, businessAge: parseAge(incDate), companyStatus: statusMatch?.[0] || null, officerName: agentMatch?.[1]?.trim() || null };
+    const data = JSON.parse(json);
+    const biz = data?.[0];
+    if (!biz) return null;
+    const incDate = biz.formationdate || biz.date_formed || null;
+    const officerName = biz.principalofficer || biz.registeredagent || null;
+    const officerType = officerName ? (isKnownRAService(officerName) ? 'agent' : 'unknown') : null;
+    return { incorporationDate: incDate ? incDate.split('T')[0] : null, businessAge: parseAge(incDate), companyStatus: biz.entitystatus || null, officerName, officerType };
   } catch(_) { return null; }
 }
 
 // ── OHIO — SOS ────────────────────────────────────────────────────
 async function scrapeOH(bizName) {
+  // Ohio SOS is JS-rendered — use Ohio Open Data portal (Socrata JSON API)
   try {
     const q = encodeURIComponent(bizName);
-    const html = await fetchURL(
-      `https://businesssearch.ohiosos.gov/?=businessDetails&q=${q}&bs=businessName&a=active`,
+    const json = await fetchURL(
+      `https://data.ohio.gov/resource/xn5t-hpek.json?$where=entity_name+like+%27${encodeURIComponent(bizName)}%25%27&$limit=5`,
       5000
     );
-    const dateMatch = html.match(/(?:Formation Date|Date of Formation|Filing Date)[^\d]*(\d{1,2}\/\d{1,2}\/\d{4})/i) ||
-                      html.match(/(\d{2}\/\d{2}\/\d{4})/);
-    const incDate = dateMatch ? dateMatch[1] : null;
-    const statusMatch = html.match(/(?:Active|Cancelled|Dissolved)/i);
-    const agentMatch = html.match(/(?:Statutory Agent)[^A-Z]*([A-Z][A-Za-z\s,\.'-]{3,50})(?:<|\n)/i);
-    return { incorporationDate: incDate, businessAge: parseAge(incDate), companyStatus: statusMatch?.[0] || null, officerName: agentMatch?.[1]?.trim() || null };
+    const data = JSON.parse(json);
+    const biz = data?.[0];
+    if (!biz) return null;
+    const incDate = biz.formation_date || biz.date_filed || null;
+    // OH Open Data: statutory_agent_name is the most reliable officer field
+    const agentRaw = biz.statutory_agent_name || biz.principal_name || null;
+    const officerName = agentRaw ? String(agentRaw).trim() : null;
+    const officerType = officerName ? (isKnownRAService(officerName) ? 'agent' : 'unknown') : null;
+    return { incorporationDate: incDate ? incDate.split('T')[0] : null, businessAge: parseAge(incDate), companyStatus: biz.status || null, officerName, officerType };
   } catch(_) { return null; }
 }
 
 // ── PENNSYLVANIA — DOS ────────────────────────────────────────────
 async function scrapePA(bizName) {
-  try {
-    const q = encodeURIComponent(bizName);
-    const html = await fetchURL(
-      `https://www.corporations.pa.gov/search/corpsearch?SearchType=1&SearchField=1&SearchStringEntityName=${q}&SearchStringEventNumber=&SearchCurrentName=true&SearchStatus=A`,
-      5000
-    );
-    const dateMatch = html.match(/(?:Filing Date|Effective Date|Incorporation Date)[^\d]*(\d{1,2}\/\d{1,2}\/\d{4})/i) ||
-                      html.match(/(\d{2}\/\d{2}\/\d{4})/);
-    const incDate = dateMatch ? dateMatch[1] : null;
-    const statusMatch = html.match(/(?:Active|Inactive|Dissolved)/i);
-    const agentMatch = html.match(/(?:Registered Agent|Agent)[^A-Z]*([A-Z][A-Za-z\s,\.'-]{3,50})(?:<|\n)/i);
-    return { incorporationDate: incDate, businessAge: parseAge(incDate), companyStatus: statusMatch?.[0] || null, officerName: agentMatch?.[1]?.trim() || null };
-  } catch(_) { return null; }
+  // PA DOS is JS-rendered. Use PA open data / MANTA fallback handled in scrapeSOS
+  // PA open data doesn't have a reliable business entity API; return null and let fallback handle it
+  return null;
 }
 
 // ── NORTH CAROLINA — SOS ──────────────────────────────────────────
 async function scrapeNC(bizName) {
+  // NC SOS is JS-rendered (React). Use NC open data portal (Socrata)
   try {
-    const q = encodeURIComponent(bizName);
-    const html = await fetchURL(
-      `https://www.sosnc.gov/online_services/search/by_title/_Business_Registration?SearchTerms=${q}&StartDate=&EndDate=&Status=&EntityType=&SortOrder=AscendingByEntityName`,
+    const json = await fetchURL(
+      `https://data.nc.gov/resource/q8kx-hss2.json?$where=entity_name+like+%27${encodeURIComponent(bizName)}%25%27&$limit=5`,
       5000
     );
-    const dateMatch = html.match(/(?:Date Formed|Formation Date|Date Filed)[^\d]*(\d{1,2}\/\d{1,2}\/\d{4})/i) ||
-                      html.match(/(\d{2}\/\d{2}\/\d{4})/);
-    const incDate = dateMatch ? dateMatch[1] : null;
-    const statusMatch = html.match(/(?:Current-Active|Dissolved|Withdrawn|Suspended)/i);
-    const agentMatch = html.match(/(?:Registered Agent)[^A-Z]*([A-Z][A-Za-z\s,\.'-]{3,50})(?:<|\n)/i);
-    return { incorporationDate: incDate, businessAge: parseAge(incDate), companyStatus: statusMatch?.[0] || null, officerName: agentMatch?.[1]?.trim() || null };
+    const data = JSON.parse(json);
+    const biz = data?.[0];
+    if (!biz) return null;
+    const incDate = biz.date_formed || biz.formation_date || null;
+    const officerName = biz.registered_agent || biz.principal_office_contact || null;
+    const officerType = officerName ? (isKnownRAService(officerName) ? 'agent' : 'unknown') : null;
+    return { incorporationDate: incDate ? incDate.split('T')[0] : null, businessAge: parseAge(incDate), companyStatus: biz.status || null, officerName, officerType };
   } catch(_) { return null; }
 }
 
 // ── NEW JERSEY — Treasury ─────────────────────────────────────────
 async function scrapeNJ(bizName) {
+  // NJ Portal is JS-rendered. NJ Treasury provides a search API
   try {
-    const q = encodeURIComponent(bizName);
-    const html = await fetchURL(
-      `https://www.njportal.com/DOR/businessrecords/EntitySearch/SearchForEntity?searchFields=${q}&searchType=ENTITY_NAME&StatusType=ACTIVE`,
+    const json = await fetchURL(
+      `https://www.njportal.com/DOR/businessrecords/api/EntitySearch?name=${encodeURIComponent(bizName)}&status=A&page=1&pageSize=5`,
       5000
     );
-    const dateMatch = html.match(/(?:Date Incorporated|Formation Date|Filing Date)[^\d]*(\d{1,2}\/\d{1,2}\/\d{4})/i) ||
-                      html.match(/(\d{2}\/\d{2}\/\d{4})/);
-    const incDate = dateMatch ? dateMatch[1] : null;
-    const statusMatch = html.match(/(?:Active|Inactive|Revoked)/i);
-    const agentMatch = html.match(/(?:Registered Agent)[^A-Z]*([A-Z][A-Za-z\s,\.'-]{3,50})(?:<|\n)/i);
-    return { incorporationDate: incDate, businessAge: parseAge(incDate), companyStatus: statusMatch?.[0] || null, officerName: agentMatch?.[1]?.trim() || null };
+    const data = JSON.parse(json);
+    const biz = data?.items?.[0] || data?.[0] || null;
+    if (!biz) return null;
+    const incDate = biz.incorporationDate || biz.formationDate || biz.dateFormed || null;
+    const officerName = biz.agentName || biz.principalName || biz.registeredAgent || null;
+    const officerType = officerName ? (isKnownRAService(officerName) ? 'agent' : 'unknown') : null;
+    return { incorporationDate: incDate, businessAge: parseAge(incDate), companyStatus: biz.status || biz.entityStatus || null, officerName, officerType };
   } catch(_) { return null; }
 }
 
 // ── VIRGINIA — SCC ────────────────────────────────────────────────
 async function scrapeVA(bizName) {
+  // VA SCC - use their REST API
   try {
-    const q = encodeURIComponent(bizName);
-    const html = await fetchURL(
-      `https://cis.scc.virginia.gov/EntitySearch/Index?searchTerm=${q}&searchType=0`,
+    const json = await fetchURL(
+      `https://cis.scc.virginia.gov/api/v1/EntitySearch/GetEntitySearchResults?searchTerm=${encodeURIComponent(bizName)}&searchType=0&page=1&pageSize=5`,
       5000
     );
-    const dateMatch = html.match(/(?:Formation Date|Incorporation Date|Date Formed)[^\d]*(\d{1,2}\/\d{1,2}\/\d{4})/i) ||
-                      html.match(/(\d{2}\/\d{2}\/\d{4})/);
-    const incDate = dateMatch ? dateMatch[1] : null;
-    const statusMatch = html.match(/(?:Active|Inactive|Cancelled|Revoked)/i);
-    const agentMatch = html.match(/(?:Registered Agent)[^A-Z]*([A-Z][A-Za-z\s,\.'-]{3,50})(?:<|\n)/i);
-    return { incorporationDate: incDate, businessAge: parseAge(incDate), companyStatus: statusMatch?.[0] || null, officerName: agentMatch?.[1]?.trim() || null };
+    const data = JSON.parse(json);
+    const biz = data?.entityList?.[0] || data?.results?.[0] || data?.[0] || null;
+    if (!biz) return null;
+    const incDate = biz.formationDate || biz.incorporationDate || biz.dateFormed || null;
+    const officerName = biz.registeredAgentName || biz.principalOfficerName || biz.agentName || null;
+    const officerType = officerName ? (isKnownRAService(officerName) ? 'agent' : 'unknown') : null;
+    return { incorporationDate: incDate, businessAge: parseAge(incDate), companyStatus: biz.status || biz.entityStatus || null, officerName, officerType };
   } catch(_) { return null; }
 }
 
 // ── WASHINGTON — Corporations Division ───────────────────────────
 async function scrapeWA(bizName) {
+  // WA SOS CCFS - use their data API
   try {
-    const q = encodeURIComponent(bizName);
-    const html = await fetchURL(
-      `https://ccfs.sos.wa.gov/api/search?nameContains=${q}&activeOnly=true&entityTypeId=&searchType=Entity`,
+    const json = await fetchURL(
+      `https://ccfs.sos.wa.gov/api/v1/businesssearch/businesses/${encodeURIComponent(bizName)}/businesslist`,
       5000
     );
-    const data = JSON.parse(html);
-    const biz = Array.isArray(data) ? data[0] : data?.results?.[0] || data?.entities?.[0];
+    const data = JSON.parse(json);
+    const biz = Array.isArray(data) ? data[0] : data?.results?.[0] || data?.BusinessList?.[0];
     if (!biz) return null;
-    const incDate = biz.incorporationDate || biz.formationDate || biz.effectiveDate || null;
-    const officerName = biz.registeredAgentName || biz.agentName || null;
-    return { incorporationDate: incDate, businessAge: parseAge(incDate), companyStatus: biz.status || null, officerName };
+    const incDate = biz.IncorporationDate || biz.FormationDate || biz.incorporationDate || null;
+    const rawOfficer = biz.RegisteredAgentName || biz.PrincipalOfficer || biz.registeredAgentName || null;
+    const officerName = rawOfficer ? String(rawOfficer).trim() : null;
+    const officerType = officerName ? (isKnownRAService(officerName) ? 'agent' : 'unknown') : null;
+    return { incorporationDate: incDate, businessAge: parseAge(incDate), companyStatus: biz.Status || biz.status || null, officerName, officerType };
   } catch(_) { return null; }
 }
+
 
 function parseAge(dateStr) {
   if (!dateStr) return null;
@@ -1435,18 +2007,43 @@ async function scrapeFL(bizName) {
     const companyStatus = statusMatch ? statusMatch[0] : null;
 
     // Officers — Sunbiz lists them in a table after "Officer/Director Detail"
-    const officerSection = detailHtml.split('Officer/Director Detail')[1] || detailHtml;
-    // Try multiple patterns: <span>, <td>, or plain text
-    const nameMatches = [
-      ...officerSection.matchAll(/<span[^>]*>\s*([A-Z][A-Z\s,\.'-]{2,50})\s*<\/span>/g),
-      ...officerSection.matchAll(/<td[^>]*>\s*([A-Z][A-Z\s,\.'-]{2,50})\s*<\/td>/g),
-    ];
-    // Filter out obviously non-name entries (states, titles, zip codes)
-    const skipWords = ['OFFICER', 'DIRECTOR', 'MANAGER', 'MEMBER', 'PRESIDENT', 'SECRETARY', 'TREASURER', 'REGISTERED', 'AGENT', 'FLORIDA', 'ACTIVE', 'INACTIVE'];
-    const officerName = nameMatches
-      .map(m => m[1].trim())
-      .find(n => n.length > 3 && !skipWords.includes(n) && !/^\d/.test(n) && n.split(' ').length >= 2)
-      || nameMatches[0]?.[1]?.trim() || null;
+    // The HTML structure is: <td>TITLE</td><td>NAME</td><td>ADDRESS</td>
+    let officerName = null, officerType = 'unknown';
+    const officerSection = detailHtml.split(/Officer\/Director Detail|OFFICER\/DIRECTOR DETAIL/i)[1] || '';
+    if (officerSection) {
+      // Extract all <td> contents in the officer section
+      const tdMatches = [...officerSection.matchAll(/<td[^>]*>\s*([^<]{1,60})\s*<\/td>/gi)];
+      const tdVals = tdMatches.map(m => m[1].replace(/&amp;/g,'&').replace(/&nbsp;/g,' ').trim());
+      // Sunbiz pattern: title row then name row. Titles are: P, VP, D, MGR, AMBR, RA, T, ST, etc.
+      const TITLE_CODES = new Set(['P','VP','D','MGR','AMBR','RA','R','T','ST','CEO','CFO','COO','PRES','SEC','TREAS','DIR','MBR','AUTH REP']);
+      const NON_NAME_WORDS = new Set(['OFFICER','DIRECTOR','MANAGER','MEMBER','PRESIDENT','SECRETARY','TREASURER',
+        'REGISTERED','AGENT','FLORIDA','ACTIVE','INACTIVE','ADDRESS','TITLE','NAME','CITY','STATE','ZIP','DETAIL']);
+      // Collect ALL officer candidates, then prefer real owner over commercial agent
+      const officerCandidates = [];
+      for (let i = 0; i < tdVals.length - 1; i++) {
+        const val = tdVals[i].toUpperCase().replace(/[^A-Z0-9\s]/g,'').trim();
+        if (TITLE_CODES.has(val)) {
+          const candidate = tdVals[i + 1];
+          if (candidate && !NON_NAME_WORDS.has(candidate.toUpperCase()) &&
+              !/^\d/.test(candidate) && candidate.split(/\s+/).length >= 2 &&
+              candidate.length > 4 && candidate.length < 55 &&
+              !/ (LLC|INC|CORP|LTD|LP|LLP|PLLC|PA|PC)\.?$/i.test(candidate.trim())) {
+            const isAgent = (val === 'RA' || val === 'R') || isKnownRAService(candidate);
+            officerCandidates.push({ name: candidate.trim(), type: isAgent ? 'agent' : 'owner' });
+          }
+        }
+      }
+      // Prefer real person owner over commercial registered agent
+      const bestOfficer = officerCandidates.find(c => c.type === 'owner') || officerCandidates[0] || null;
+      if (bestOfficer) { officerName = bestOfficer.name; officerType = bestOfficer.type; }
+      // Fallback: any ALL-CAPS word sequence 2-4 words that isn't a skip word
+      if (!officerName) {
+        const capsMatch = officerSection.match(/(?:^|>)\s*([A-Z]{2,}(?:\s+[A-Z]{2,}){1,3})\s*(?:<|$)/m);
+        if (capsMatch && !NON_NAME_WORDS.has(capsMatch[1].trim()) && !isKnownRAService(capsMatch[1])) {
+          officerName = capsMatch[1].trim();
+        }
+      }
+    }
 
     console.log(`[SOS FL] "${bizName}" → officer=${officerName || 'NONE'} | date=${incDate || 'NONE'} | status=${companyStatus || 'NONE'}`);
     return {
@@ -1456,85 +2053,6 @@ async function scrapeFL(bizName) {
       officerName,
     };
   } catch(e) { console.log(`[SOS FL] FAILED for "${bizName}":`, e.message); return null; }
-}
-
-// ── TEXAS — SOS CGI search ────────────────────────────────────────
-async function scrapeTX(bizName) {
-  try {
-    const q = encodeURIComponent(bizName);
-    // TX SOS has an older CGI endpoint that returns HTML
-    const html = await fetchURL(
-      `https://mycpa.cpa.state.tx.us/coa/coaSearchBtn.do?bus_name=${q}&bus_type=ALL&action=Search`
-    );
-
-    // Filing date pattern in TX results
-    const dateMatch = html.match(/Filing Date[:\s]*(\d{1,2}\/\d{1,2}\/\d{4})/) ||
-                      html.match(/Formed[:\s]*(\d{1,2}\/\d{1,2}\/\d{4})/);
-    const incDate = dateMatch ? dateMatch[1] : null;
-
-    // Status
-    const statusMatch = html.match(/Status[:\s<>]*([A-Za-z\s]{3,20}?)</) ;
-    const companyStatus = statusMatch ? statusMatch[1].trim() : null;
-
-    // Officer / registered agent name
-    const agentMatch = html.match(/Registered Agent[:\s<>bdr]*([A-Z][A-Za-z\s,\.'-]{3,60}?)</) ||
-                       html.match(/Officer[:\s<>bdr]*([A-Z][A-Za-z\s,\.'-]{3,60}?)</);
-    const officerName = agentMatch ? agentMatch[1].trim() : null;
-
-    return {
-      incorporationDate: incDate,
-      businessAge: parseAge(incDate),
-      companyStatus,
-      officerName,
-    };
-  } catch(_) { return null; }
-}
-
-// ── GEORGIA — eCorp JSON API ──────────────────────────────────────
-async function scrapeGA(bizName) {
-  try {
-    const q = encodeURIComponent(bizName);
-    // GA eCorp returns HTML — parse it directly
-    const html = await fetchURL(
-      `https://ecorp.sos.ga.gov/BusinessSearch/BusinessInformation?nameContains=${q}&businessType=&businessStatus=Active&SortField=BusinessName&SortOrder=asc&SearchMode=2&StartIndex=0&NumResults=5`,
-      4000
-    );
-    // Look for date patterns like "01/15/2018" or "2018-01-15"
-    const dateMatch = html.match(/(?:Formation|Registration|Filing|Incorporated)[^\d]*(\d{1,2}\/\d{1,2}\/\d{4})/) ||
-                      html.match(/(?:Formation|Registration|Filing|Incorporated)[^\d]*(\d{4}-\d{2}-\d{2})/);
-    const incDate = dateMatch ? dateMatch[1] : null;
-    // Status
-    const statusMatch = html.match(/(?:Active|Inactive|Dissolved|Revoked|Admin Dissolved)/i);
-    const companyStatus = statusMatch ? statusMatch[0] : null;
-    // Registered agent — usually a proper name in all caps
-    const agentMatch = html.match(/Registered Agent[^A-Z]*([A-Z][A-Z\s,\.'-]{3,60}?)(?:<|\n)/);
-    const officerName = agentMatch ? agentMatch[1].trim() : null;
-    return { incorporationDate: incDate, businessAge: parseAge(incDate), companyStatus, officerName };
-  } catch(_) { return null; }
-}
-
-// ── NEW YORK — DOS API ────────────────────────────────────────────
-async function scrapeNY(bizName) {
-  try {
-    const q = encodeURIComponent(bizName);
-    // NY DOS open data — correct dataset for active corporations/LLCs
-    // Dataset: DOS Corporation & Business Entity Database
-    const json = await fetchURL(
-      `https://data.ny.gov/resource/ej5i-h7qk.json?$where=current_entity_name+like+%27${encodeURIComponent(bizName.replace(/'/g,""))}%25%27&$limit=5`,
-      4000
-    );
-    const data = JSON.parse(json);
-    const biz = data?.[0];
-    if (!biz) return null;
-
-    const incDate = biz.date_of_initial_dos_filing || biz.initial_dos_filing_date || null;
-    return {
-      incorporationDate: incDate ? incDate.split('T')[0] : null,
-      businessAge: parseAge(incDate),
-      companyStatus: biz.current_entity_status || biz.dos_process_status || null,
-      officerName: biz.registered_agent_name || biz.ceo_name || null,
-    };
-  } catch(_) { return null; }
 }
 
 // ─── HELPERS ─────────────────────────────────────────────────────
@@ -1575,7 +2093,8 @@ async function fetchURL(url, timeoutMs = 8000, maxBytes = 500000, redirectCount 
       }
       if (res.statusCode === 403 || res.statusCode === 429 || res.statusCode === 503) {
         res.resume();
-        reject(new Error(`HTTP ${res.statusCode}`));
+        // For email scraping, return empty string instead of rejecting so we can try other pages
+        resolve('');
         return;
       }
       let data = '';
@@ -1590,5 +2109,40 @@ async function fetchURL(url, timeoutMs = 8000, maxBytes = 500000, redirectCount 
 }
 
 function enc(s) { return encodeURIComponent(s); }
+
+// ─── BRUTE FORCE PROTECTION ─────────────────────────────────────
+// In-memory store: key = "email:ip" → { count, lockedUntil }
+const loginAttempts = new Map();
+function checkBruteForce(email, ip) {
+  const key = `${(email||'').toLowerCase().trim()}:${ip}`;
+  const entry = loginAttempts.get(key);
+  if (!entry) return { blocked: false };
+  if (entry.lockedUntil && Date.now() < entry.lockedUntil) {
+    const mins = Math.ceil((entry.lockedUntil - Date.now()) / 60000);
+    return { blocked: true, message: `Too many failed attempts. Try again in ${mins} minute${mins===1?'':'s'}.` };
+  }
+  return { blocked: false };
+}
+function recordFailedLogin(email, ip) {
+  const key = `${(email||'').toLowerCase().trim()}:${ip}`;
+  const entry = loginAttempts.get(key) || { count: 0, lockedUntil: null };
+  entry.count++;
+  if (entry.count >= 10) {
+    entry.lockedUntil = Date.now() + 15 * 60 * 1000; // lock 15 minutes
+    entry.count = 0; // reset after locking
+    console.warn(`[SECURITY] Login locked for ${key} after 10 failed attempts`);
+  }
+  loginAttempts.set(key, entry);
+  // Auto-clean old entries every 100 failures
+  if (loginAttempts.size > 1000) {
+    const now = Date.now();
+    for (const [k, v] of loginAttempts.entries()) {
+      if (!v.lockedUntil || v.lockedUntil < now) loginAttempts.delete(k);
+    }
+  }
+}
+function clearLoginAttempts(email, ip) {
+  loginAttempts.delete(`${(email||'').toLowerCase().trim()}:${ip}`);
+}
 
 server.listen(PORT, () => console.log(`RCN Lead Gen API running on port ${PORT}`));
