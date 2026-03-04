@@ -8,9 +8,17 @@ const PORT = process.env.PORT || 3000;
 const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;
 const POSTGRES_URL = process.env.POSTGRES_URL;
 const JWT_SECRET = process.env.JWT_SECRET || "rcn-lead-gen-secret-change-in-prod";
-const HERE_API_KEY = process.env.HERE_API_KEY || null;
+const HERE_API_KEY   = process.env.HERE_API_KEY   || null;
+const HUNTER_API_KEY = process.env.HUNTER_API_KEY || null;
+const PDL_API_KEY    = process.env.PDL_API_KEY    || null;
 
-const SBA_CSV_URL = "https://data.sba.gov/dataset/0ff8e8e9-b967-4f4e-987c-6ac78c575087/resource/d67d3ccb-2002-4134-a288-481b51cd3479/download/foia-7a-fy2020-present-as-of-251231.csv";
+// SBA dataset page — we fetch this to find the current CSV download link
+// so we never break when SBA publishes a new quarterly file
+const SBA_DATASET_PAGE = "https://data.sba.gov/dataset/0ff8e8e9-b967-4f4e-987c-6ac78c575087";
+
+// MCA-relevant NAICS prefixes — skip agriculture, mining, manufacturing, government
+// This cuts ~40% of records and keeps RAM under Railway's 512MB limit
+const MCA_NAICS_PREFIXES = ["23","44","45","48","49","52","53","54","56","61","62","71","72","81"];
 
 const PLAN_LIMITS = {
   pro: 1000,
@@ -25,8 +33,10 @@ let sbaLoading = false;
 let sbaLoadError = null;
 
 function normalizeName(name) {
+  // Only strip legal entity suffixes — NOT meaningful business words
+  // "Smith Consulting" should stay "smith consulting" not "smith"
   return name.toLowerCase()
-    .replace(/\b(llc|inc|corp|co|ltd|dba|the|and|&|lp|llp|pllc|pa|na|nv|group|services|solutions|company|enterprises|management|associates|consulting)\b/g, "")
+    .replace(/\b(llc|inc|corp|co\.?|ltd|dba|the|and|&|lp|llp|pllc|pa|na|nv)\b/g, "")
     .replace(/[^a-z0-9\s]/g, "")
     .replace(/\s+/g, " ")
     .trim();
@@ -46,30 +56,115 @@ function parseCSVLine(line) {
   return result;
 }
 
+// ─── STATE EXTRACTION ───────────────────────────────────────────
+// Robust: handles "FL 33101", "Florida 33101", "United States", HERE format, etc.
+const US_STATE_CODES = new Set(['AL','AK','AZ','AR','CA','CO','CT','DE','FL','GA',
+  'HI','ID','IL','IN','IA','KS','KY','LA','ME','MD','MA','MI','MN','MS','MO',
+  'MT','NE','NV','NH','NJ','NM','NY','NC','ND','OH','OK','OR','PA','RI','SC',
+  'SD','TN','TX','UT','VT','VA','WA','WV','WI','WY','DC']);
+const US_STATE_NAMES = {
+  'alabama':'AL','alaska':'AK','arizona':'AZ','arkansas':'AR','california':'CA',
+  'colorado':'CO','connecticut':'CT','delaware':'DE','florida':'FL','georgia':'GA',
+  'hawaii':'HI','idaho':'ID','illinois':'IL','indiana':'IN','iowa':'IA',
+  'kansas':'KS','kentucky':'KY','louisiana':'LA','maine':'ME','maryland':'MD',
+  'massachusetts':'MA','michigan':'MI','minnesota':'MN','mississippi':'MS',
+  'missouri':'MO','montana':'MT','nebraska':'NE','nevada':'NV','new hampshire':'NH',
+  'new jersey':'NJ','new mexico':'NM','new york':'NY','north carolina':'NC',
+  'north dakota':'ND','ohio':'OH','oklahoma':'OK','oregon':'OR','pennsylvania':'PA',
+  'rhode island':'RI','south carolina':'SC','south dakota':'SD','tennessee':'TN',
+  'texas':'TX','utah':'UT','vermont':'VT','virginia':'VA','washington':'WA',
+  'west virginia':'WV','wisconsin':'WI','wyoming':'WY','district of columbia':'DC'
+};
+
+function extractStateFromAddress(address) {
+  if (!address) return '';
+  const parts = address.split(',').map(p => p.trim());
+  // Check each comma-part for a 2-letter state code (possibly followed by zip: "FL 33101")
+  for (const part of parts) {
+    const code = part.split(/\s+/)[0].toUpperCase();
+    if (US_STATE_CODES.has(code)) return code;
+  }
+  // Check for full state name (HERE uses "Florida", "Texas", etc.)
+  const lower = address.toLowerCase();
+  for (const [name, code] of Object.entries(US_STATE_NAMES)) {
+    const re = new RegExp('\\b' + name + '\\b');
+    if (re.test(lower)) return code;
+  }
+  return '';
+}
+
+// Use the CKAN JSON API to find the current CSV download URL
+// This is far more reliable than HTML scraping — it's a stable machine-readable API
+// Falls back to a known URL if the API is unavailable
+const SBA_DATASET_ID  = "0ff8e8e9-b967-4f4e-987c-6ac78c575087";
+const SBA_FALLBACK_URL = "https://data.sba.gov/dataset/0ff8e8e9-b967-4f4e-987c-6ac78c575087/resource/d67d3ccb-2002-4134-a288-481b51cd3479/download/foia-7a-fy2020-present-as-of-251231.csv";
+
+async function getSBADownloadUrl() {
+  try {
+    const apiUrl = `https://data.sba.gov/api/3/action/package_show?id=${SBA_DATASET_ID}`;
+    const raw = await new Promise((resolve, reject) => {
+      https.get(apiUrl, { headers: { "User-Agent": "Mozilla/5.0", "Accept": "application/json" } }, (res) => {
+        let data = "";
+        res.on("data", c => { data += c; if (data.length > 500000) res.destroy(); });
+        res.on("end", () => resolve(data));
+        res.on("error", reject);
+      }).on("error", reject).setTimeout(10000, function() { this.destroy(); reject(new Error("CKAN API timeout")); });
+    });
+    const json = JSON.parse(raw);
+    if (!json.success) throw new Error("CKAN API returned success=false");
+    const resources = json.result?.resources || [];
+    // Find resources that are CSVs for the 7(a) "present" (most recent) file
+    const csvResources = resources.filter(r =>
+      r.format === "CSV" &&
+      r.url &&
+      r.url.includes("foia-7a") &&
+      (r.url.toLowerCase().includes("present") || (r.name || "").toLowerCase().includes("present"))
+    );
+    if (csvResources.length === 0) throw new Error("No 7(a) present CSV found in CKAN resources");
+    // Sort by URL descending — date suffix in filename means highest = most recent
+    csvResources.sort((a, b) => b.url.localeCompare(a.url));
+    console.log(`📋 CKAN API found ${csvResources.length} present CSV(s), using: ${csvResources[0].url}`);
+    return csvResources[0].url;
+  } catch(e) {
+    console.log("⚠️  CKAN API failed:", e.message, "— using fallback URL");
+    return SBA_FALLBACK_URL;
+  }
+}
+
+// Follow redirects for a plain https/http get, up to 5 hops
+function getFollowRedirects(url, options, callback, hops) {
+  if ((hops || 0) > 5) { callback(new Error("Too many redirects")); return; }
+  const proto = url.startsWith("https") ? https : http;
+  const req = proto.get(url, options, (res) => {
+    if ([301,302,303,307,308].includes(res.statusCode) && res.headers.location) {
+      res.resume();
+      const next = res.headers.location.startsWith("http") ? res.headers.location
+        : new URL(res.headers.location, url).href;
+      getFollowRedirects(next, options, callback, (hops||0)+1);
+      return;
+    }
+    callback(null, res);
+  });
+  req.setTimeout(300000, () => { req.destroy(); callback(new Error("timeout")); });
+  req.on("error", callback);
+}
+
 async function loadSBAData() {
   if (sbaIndex || sbaLoading) return;
   sbaLoading = true;
-  console.log("📊 Loading SBA data (streaming)...");
+  sbaLoadError = null;
+  console.log("📊 SBA load starting — fetching current CSV URL...");
   try {
-    await new Promise((resolve, reject) => {
-      const proto = SBA_CSV_URL.startsWith("https") ? https : http;
-      const req = proto.get(SBA_CSV_URL, (res) => {
-        if ((res.statusCode === 301 || res.statusCode === 302) && res.headers.location) {
-          req.destroy();
-          // follow redirect
-          const redir = res.headers.location;
-          const rproto = redir.startsWith("https") ? https : http;
-          const rreq = rproto.get(redir, streamResponse).on("error", reject);
-          rreq.setTimeout(300000, () => { rreq.destroy(); reject(new Error("SBA redirect timeout")); });
-          return;
-        }
-        streamResponse(res);
-      }).on("error", reject);
-      req.setTimeout(300000, () => { req.destroy(); reject(new Error("SBA download timeout")); });
+    const csvUrl = await getSBADownloadUrl();
+    console.log("📊 Streaming SBA CSV:", csvUrl);
 
-      function streamResponse(res) {
+    await new Promise((resolve, reject) => {
+      getFollowRedirects(csvUrl, { headers: { "User-Agent": "Mozilla/5.0" } }, (err, res) => {
+        if (err) return reject(err);
+        if (res.statusCode !== 200) return reject(new Error(`SBA CSV returned HTTP ${res.statusCode}`));
+
         const index = {};
-        let count = 0;
+        let count = 0, skipped = 0;
         let headerParsed = false;
         let idx = {};
         let leftover = "";
@@ -77,7 +172,7 @@ async function loadSBAData() {
         res.on("data", chunk => {
           const text = leftover + chunk.toString();
           const lines = text.split("\n");
-          leftover = lines.pop(); // last partial line saved for next chunk
+          leftover = lines.pop();
           for (const line of lines) {
             if (!line.trim()) continue;
             if (!headerParsed) {
@@ -93,20 +188,31 @@ async function loadSBAData() {
                 jobs:   headers.findIndex(h => /JobsSupported/i.test(h)),
               };
               headerParsed = true;
+              if (idx.name < 0) { reject(new Error("CSV header parse failed — name col not found")); return; }
+              console.log(`📊 SBA CSV headers parsed. Columns: name=${idx.name} state=${idx.state} amount=${idx.amount} naics=${idx.naics}`);
               continue;
             }
             const cols = parseCSVLine(line);
             const name = (cols[idx.name] || "").replace(/"/g, "").trim();
             if (!name) continue;
+
+            // Filter: only MCA-relevant NAICS codes — cuts ~40% of records, saves RAM
+            const naics = (cols[idx.naics] || "").replace(/"/g, "").trim();
+            if (naics && !MCA_NAICS_PREFIXES.some(p => naics.startsWith(p))) {
+              skipped++; continue;
+            }
+
+            // Filter: skip tiny loans (not useful as revenue signal)
             const amount = parseFloat((cols[idx.amount] || "0").replace(/[^0-9.]/g, "")) || 0;
-            if (amount < 10000) continue;
+            if (amount < 25000) { skipped++; continue; }
+
             const key = normalizeName(name);
-            if (!key) continue;
+            if (!key || key.length < 3) continue;
             const record = {
               name,
               city:   (cols[idx.city]   || "").replace(/"/g, "").trim(),
               state:  (cols[idx.state]  || "").replace(/"/g, "").trim().toUpperCase(),
-              naics:  (cols[idx.naics]  || "").replace(/"/g, "").trim(),
+              naics,
               amount,
               date:   (cols[idx.date]   || "").replace(/"/g, "").trim(),
               lender: (cols[idx.lender] || "").replace(/"/g, "").trim(),
@@ -116,65 +222,103 @@ async function loadSBAData() {
             if (!index[key]) index[key] = [];
             index[key].push(record);
             count++;
+            if (count % 50000 === 0) console.log(`📊 SBA indexed ${count} records so far...`);
           }
         });
+
         res.on("end", () => {
+          // Process any remaining data in leftover (last line if no trailing newline)
+          if (leftover.trim()) {
+            const cols = parseCSVLine(leftover);
+            const name = (cols[idx.name] || "").replace(/"/g, "").trim();
+            if (name) {
+              const naics = (cols[idx.naics] || "").replace(/"/g, "").trim();
+              const amount = parseFloat((cols[idx.amount] || "0").replace(/[^0-9.]/g, "")) || 0;
+              if (amount >= 25000 && (!naics || MCA_NAICS_PREFIXES.some(p => naics.startsWith(p)))) {
+                const key = normalizeName(name);
+                if (key && key.length >= 3) {
+                  const record = {
+                    name,
+                    city:   (cols[idx.city]   || "").replace(/"/g, "").trim(),
+                    state:  (cols[idx.state]  || "").replace(/"/g, "").trim().toUpperCase(),
+                    naics,
+                    amount,
+                    date:   (cols[idx.date]   || "").replace(/"/g, "").trim(),
+                    lender: (cols[idx.lender] || "").replace(/"/g, "").trim(),
+                    jobs:   parseInt((cols[idx.jobs] || "0").replace(/[^0-9]/g, "")) || 0,
+                    estMonthlyRevenue: Math.round((amount * 8) / 12),
+                  };
+                  if (!index[key]) index[key] = [];
+                  index[key].push(record);
+                  count++;
+                }
+              }
+            }
+          }
+          if (count === 0) { reject(new Error("SBA CSV parsed but 0 records indexed — possible format change")); return; }
           sbaIndex = index;
           sbaLoading = false;
-          console.log(`✅ SBA data loaded — ${count} records indexed`);
+          console.log(`✅ SBA loaded — ${count} records indexed, ${skipped} skipped (non-MCA NAICS or tiny loans)`);
           resolve();
         });
         res.on("error", reject);
-      }
+      });
     });
   } catch(err) {
     sbaLoadError = err.message;
     sbaLoading = false;
-    console.error("❌ SBA load failed:", err.message, "— will retry in 30s");
-    setTimeout(loadSBAData, 30000);
+    console.error("❌ SBA load failed:", err.message, "— will retry in 60s");
+    setTimeout(loadSBAData, 60000);
   }
 }
 
 function lookupSBA(businessName, state) {
   if (!sbaIndex) return null;
   const key = normalizeName(businessName);
-  if (!key) return null;
+  if (!key || key.length < 3) return null;
 
-  // 1. Exact normalized match
+  // Tier 1: exact normalized match
   let matches = sbaIndex[key] || [];
 
-  // 2. Partial key match — search key starts with or contains our key
-  if (matches.length === 0 && key.length > 4) {
+  // Tier 2: prefix match — one key starts with the other (handles Inc/LLC differences)
+  // Only do this if key is at least 6 chars to avoid matching "home" → "home depot"
+  if (matches.length === 0 && key.length >= 6) {
     for (const [k, records] of Object.entries(sbaIndex)) {
       if (k.startsWith(key) || key.startsWith(k)) {
         matches = [...matches, ...records];
-        if (matches.length > 10) break;
+        if (matches.length >= 10) break;
       }
     }
   }
 
-  // 3. Scored word match — rank by how many significant words overlap
+  // Tier 3: scored word overlap — TIGHTER rules to avoid false positives
+  // Require ALL significant words (>3 chars) to match, not just 50%
+  // Also require at least 2 significant words — single-word matches are too loose
   if (matches.length === 0) {
     const words = key.split(" ").filter(w => w.length > 3);
-    if (words.length > 0) {
+    if (words.length >= 2) {
+      // Only search if state is known — narrows the universe dramatically
       const scored = [];
       for (const [k, records] of Object.entries(sbaIndex)) {
+        // Must have state match if we know the state
+        if (state && !records.some(r => r.state === state)) continue;
         const matchCount = words.filter(w => k.includes(w)).length;
-        if (matchCount >= Math.max(1, Math.ceil(words.length * 0.5))) {
+        // All significant words must match (not 50%) — strict
+        if (matchCount === words.length) {
           scored.push({ score: matchCount, records });
         }
       }
-      // Sort by score descending, take best matches
       scored.sort((a, b) => b.score - a.score);
-      for (const { records } of scored.slice(0, 5)) {
+      for (const { records } of scored.slice(0, 3)) {
         matches = [...matches, ...records];
       }
     }
   }
 
   if (matches.length === 0) return null;
+
   // Prefer state match, then highest loan amount
-  const stateMatches = matches.filter(r => r.state === state);
+  const stateMatches = state ? matches.filter(r => r.state === state) : matches;
   const pool = stateMatches.length > 0 ? stateMatches : matches;
   return pool.sort((a, b) => b.amount - a.amount)[0];
 }
@@ -293,7 +437,7 @@ const server = http.createServer(async (req, res) => {
 
   if (url.pathname === "/" || url.pathname === "/warmup") {
     loadSBAData(); // trigger load if not already started
-    respond(res, 200, { status: "ok", service: "RCN Lead Gen API", sba_ready: !!sbaIndex, sba_loading: sbaLoading });
+    respond(res, 200, { status: "ok", service: "RCN Lead Gen API", sba_ready: !!sbaIndex, sba_loading: sbaLoading, sba_error: sbaLoadError || null, sba_count: sbaIndex ? Object.keys(sbaIndex).length : 0 });
     return;
   }
 
@@ -481,11 +625,8 @@ const server = http.createServer(async (req, res) => {
       const sosSupported = new Set(['FL','TX','GA','NY','CA','IL','AZ','CO','OH','PA','NC','NJ','VA','WA']);
       await Promise.all(detailed.map(async (lead) => {
         try {
-          const addrParts = (lead.address || '').split(',');
-          const stateRaw = addrParts[addrParts.length - 1]?.trim() || // "FL 33101" or "FL"
-                           addrParts[addrParts.length - 2]?.trim(); // fallback
-          const stateCode = (stateRaw || '').replace(/\d/g,'').trim().toUpperCase().substring(0,2);
-          if (!sosSupported.has(stateCode)) return;
+          const stateCode = extractStateFromAddress(lead.address || '');
+          if (!stateCode || !sosSupported.has(stateCode)) return;
           const sosData = await Promise.race([
             scrapeSOS(lead.businessName, stateCode),
             new Promise(r => setTimeout(() => r(null), 4000))
@@ -510,10 +651,11 @@ const server = http.createServer(async (req, res) => {
   if (url.pathname === "/enrich") {
     const decoded = verifyToken(req);
     if (!decoded) { respond(res, 401, { error: "Unauthorized" }); return; }
-    const placeId     = url.searchParams.get("placeId");
-    const websiteHint = url.searchParams.get("website") || "";
-    const bizName     = url.searchParams.get("name") || "";
-    const bizState    = url.searchParams.get("state") || "";
+    const placeId      = url.searchParams.get("placeId");
+    const websiteHint  = url.searchParams.get("website") || "";
+    const bizName      = url.searchParams.get("name") || "";
+    const bizState     = url.searchParams.get("state") || "";
+    const officerParam = url.searchParams.get("officerName") || "";
     if (!placeId) { respond(res, 400, { error: "placeId required" }); return; }
     try {
       console.log(`[ENRICH] "${bizName}" | state=${bizState} | placeId=${placeId.substring(0,20)} | websiteHint=${websiteHint ? 'yes' : 'no'}`);
@@ -546,25 +688,61 @@ const server = http.createServer(async (req, res) => {
       }
       const sosUrl = buildSOSUrl(bizName, bizState);
 
-      // Run email scrape + SOS lookup in parallel to save time
-      const [email, sosData] = await Promise.all([
+      // Run all enrichment in parallel: email scrape, SOS, Hunter.io, PDL
+      const resolvedOfficer = officerParam || null; // use what client already has from auto-SOS
+      const domain = siteUrl ? siteUrl.replace(/^https?:\/\/(www\.)?/, '').split('/')[0] : null;
+
+      const [htmlEmail, sosData, hunterResult, pdlResult] = await Promise.all([
+        // HTML email scrape (fallback only)
         siteUrl
-          ? Promise.race([scrapeEmail(siteUrl), new Promise(r => setTimeout(() => r(null), 8000))])
+          ? Promise.race([scrapeEmail(siteUrl), new Promise(r => setTimeout(() => r(null), 6000))])
           : Promise.resolve(null),
+        // SOS officer lookup
         Promise.race([
           scrapeSOS(bizName, bizState),
           new Promise(r => setTimeout(() => r(null), 5000))
         ]),
+        // Hunter.io: domain-based email search (much better than HTML scraping)
+        domain
+          ? hunterDomainSearch(domain, resolvedOfficer)
+          : Promise.resolve(null),
+        // PDL: person lookup for owner cell + personal email
+        resolvedOfficer
+          ? pdlPersonLookup(resolvedOfficer, bizName, bizState)
+          : Promise.resolve(null),
       ]);
 
-      console.log(`[ENRICH] Result → phone=${phone ? 'YES' : 'NO'} | site=${siteUrl ? 'YES' : 'NO'} | email=${email ? 'YES' : 'NO'} | officer=${sosData?.officerName ? sosData.officerName.substring(0,20) : 'NONE'} | incDate=${sosData?.incorporationDate || 'NONE'}`);
+      // Resolve best officer name (PDL might find a cleaner version)
+      const officerName = sosData?.officerName || resolvedOfficer || null;
+
+      // Resolve best email — hunter >> html scrape, personal email >> work email
+      const hunterEmail  = hunterResult?.email || null;
+      const ownerEmail   = pdlResult?.ownerEmail || null;
+      const workEmail    = hunterEmail || htmlEmail || null;
+      const bestEmail    = ownerEmail || workEmail; // personal email wins
+      const emailSource  = ownerEmail ? 'pdl-personal' : hunterEmail ? 'hunter' : htmlEmail ? 'html-scrape' : null;
+
+      // Owner direct phone from PDL
+      const ownerPhone   = pdlResult?.ownerPhone || null;
+      const linkedIn     = pdlResult?.linkedIn || (officerName
+        ? `https://www.linkedin.com/search/results/people/?keywords=${encodeURIComponent(officerName + ' ' + bizName)}`
+        : null);
+
+      console.log(`[ENRICH] Result → phone=${phone ? 'YES' : 'NO'} | ownerPhone=${ownerPhone ? 'YES' : 'NO'} | email=${bestEmail || 'NONE'} (src:${emailSource}) | officer=${officerName ? officerName.substring(0,20) : 'NONE'} | linkedin=${linkedIn ? 'YES' : 'NO'}`);
       respond(res, 200, {
-        phone, website: siteUrl, address, email, sosUrl,
+        phone, website: siteUrl, address, sosUrl,
         reviewCount, businessStatus, hasHours,
+        // Owner contact
+        email: bestEmail,
+        emailSource,
+        ownerPhone,
+        ownerEmail,
+        linkedIn,
+        // Company data
         incorporationDate: sosData?.incorporationDate || null,
         businessAge: sosData?.businessAge || null,
         companyStatus: sosData?.companyStatus || null,
-        officerName: sosData?.officerName || null,
+        officerName,
       });
     } catch(err) { console.error(err); respond(res, 500, { error: err.message }); }
     return;
@@ -851,6 +1029,108 @@ function fetchPageEmails(hostname, path, proto) {
       req.end();
     } catch(_) { resolve([]); }
   });
+}
+
+// ── HUNTER.IO — domain email search ──────────────────────────────
+// Returns best email found at a domain, preferring owner-sounding ones
+// Falls back to HTML scrape if no Hunter key or no results
+async function hunterDomainSearch(domain, officerName) {
+  if (!HUNTER_API_KEY || !domain) return null;
+  try {
+    const cleanDomain = domain.replace(/^https?:\/\/(www\.)?/, '').split('/')[0];
+    const url = `https://api.hunter.io/v2/domain-search?domain=${encodeURIComponent(cleanDomain)}&api_key=${HUNTER_API_KEY}&limit=10`;
+    const raw = await Promise.race([
+      fetchURL(url, 5000),
+      new Promise(r => setTimeout(() => r(null), 5000))
+    ]);
+    if (!raw) return null;
+    const data = JSON.parse(raw);
+    const emails = data?.data?.emails || [];
+    if (emails.length === 0) return null;
+
+    // If we have an officer name, try to match first/last name to an email
+    if (officerName) {
+      const parts = officerName.trim().split(/\s+/);
+      const firstName = parts[0]?.toLowerCase();
+      const lastName  = parts[parts.length - 1]?.toLowerCase();
+      // Direct name match in email local part
+      const nameMatch = emails.find(e => {
+        const local = e.value.split('@')[0].toLowerCase();
+        return local.includes(firstName) || local.includes(lastName);
+      });
+      if (nameMatch) {
+        console.log(`[HUNTER] Name match: ${nameMatch.value} (confidence: ${nameMatch.confidence})`);
+        return { email: nameMatch.value, confidence: nameMatch.confidence, source: 'hunter-name' };
+      }
+    }
+
+    // Otherwise return highest confidence non-generic email
+    const genericPrefixes = ['info','contact','hello','admin','support','office','mail','team','sales','help','enquiries','billing','accounts'];
+    const best = emails
+      .sort((a, b) => (b.confidence || 0) - (a.confidence || 0))
+      .find(e => {
+        const local = e.value.split('@')[0].toLowerCase();
+        return !genericPrefixes.includes(local);
+      });
+    const fallback = emails.sort((a, b) => (b.confidence || 0) - (a.confidence || 0))[0];
+    const result = best || fallback;
+    if (result) {
+      console.log(`[HUNTER] Best email: ${result.value} (confidence: ${result.confidence})`);
+      return { email: result.value, confidence: result.confidence, source: 'hunter-domain' };
+    }
+    return null;
+  } catch(e) {
+    console.log('[HUNTER] error:', e.message);
+    return null;
+  }
+}
+
+// ── PEOPLE DATA LABS — owner phone + email lookup ─────────────────
+// Uses person enrichment API: name + company → cell phone + personal email
+async function pdlPersonLookup(officerName, bizName, bizState) {
+  if (!PDL_API_KEY || !officerName || !bizName) return null;
+  try {
+    const parts = officerName.trim().split(/\s+/);
+    const firstName = parts[0] || '';
+    const lastName  = parts.slice(1).join(' ') || '';
+    if (!firstName || !lastName) return null;
+
+    const params = new URLSearchParams({
+      first_name: firstName,
+      last_name:  lastName,
+      company:    bizName,
+      region:     bizState || '',
+      pretty:     'false',
+    });
+    const url = `https://api.peopledatalabs.com/v5/person/enrich?${params}`;
+    const raw = await Promise.race([
+      fetchURL(url + `&api_key=${PDL_API_KEY}`, 6000),
+      new Promise(r => setTimeout(() => r(null), 6000))
+    ]);
+    if (!raw) return null;
+    const data = JSON.parse(raw);
+    if (data.status !== 200 || !data.data) return null;
+
+    const person = data.data;
+    // Extract best phone (mobile preferred)
+    const phones = person.phone_numbers || [];
+    const mobilePhone = phones.find(p => p.type === 'mobile')?.number
+      || phones[0]?.number || null;
+
+    // Personal email (not work domain)
+    const workDomain = bizName.toLowerCase().replace(/[^a-z0-9]/g,'').substring(0,10);
+    const emails = person.emails || [];
+    const personalEmail = emails.find(e => !e.address.includes(workDomain))?.address
+      || emails[0]?.address || null;
+
+    const linkedIn = person.linkedin_url || null;
+
+    console.log(`[PDL] ${officerName} → phone=${mobilePhone ? 'YES' : 'NO'} | email=${personalEmail ? 'YES' : 'NO'} | linkedin=${linkedIn ? 'YES' : 'NO'}`);
+    return { ownerPhone: mobilePhone, ownerEmail: personalEmail, linkedIn, source: 'pdl' };
+  } catch(e) {
+    console.log('[PDL] error:', e.message);
+    return null;
+  }
 }
 
 async function scrapeEmail(siteUrl) {
