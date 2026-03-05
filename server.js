@@ -885,7 +885,7 @@ document.addEventListener('click', function(e) {
 
 const PROXY_URL = "https://mca-proxy-production.up.railway.app";
 
-// Multiple search terms per industry — more variations = different Google result sets = more unique leads
+// Multiple search terms per industry — more variations = more unique leads from our databases
 const SEARCH_TERMS = {
   // ── TRADES & CONSTRUCTION ────────────────────────────────────────
   "Commercial Roofing":              ["roofing contractor", "commercial roofing", "roofing company"],
@@ -1061,7 +1061,7 @@ let authToken = localStorage.getItem('rcn_token') || null;
 
 let currentUser = null;
 
-async function apiAuth(endpoint, body) {
+async async function apiAuth(endpoint, body) {
   const res = await fetch(PROXY_URL + endpoint, {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
@@ -1106,7 +1106,7 @@ let state = {
   selectedState: 'FL',
   selectedCity: '',
   selectedIndustries: [],
-  maxLeads: 10,
+  maxLeads: 75,
   sbaOnly: false,
   sbaReady: false,
   sbaWarming: false,
@@ -1122,10 +1122,15 @@ let state = {
   leadNotes: JSON.parse(localStorage.getItem('leadNotes') || '{}'),
   profileEditing: null,
   profileMsg: '',
+  callLog: JSON.parse(localStorage.getItem('rcn_callLog') || '[]'),
+  dialerOpen: false,
+  dialerLead: null,
+  callTimer: 0,
+  callTimerInterval: null,
 };
 
 
-// Robust state extraction — handles Google "FL 33101, USA", HERE "Florida 33101, United States"
+// Robust state extraction — handles HERE "Florida 33101, United States" and OSM formats
 const CLIENT_US_STATE_CODES = new Set(['AL','AK','AZ','AR','CA','CO','CT','DE','FL','GA',
   'HI','ID','IL','IN','IA','KS','KY','LA','ME','MD','MA','MI','MN','MS','MO',
   'MT','NE','NV','NH','NJ','NM','NY','NC','ND','OH','OK','OR','PA','RI','SC',
@@ -1194,13 +1199,8 @@ if (authToken) {
   });
 }
 
-// ─── XSS PROTECTION ─────────────────────────────────────────────
-function esc(str) {
-  if (!str) return '';
-  return String(str)
-    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
-    .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
-}
+// ─── XSS PROTECTION — escHtml used throughout, esc is alias ────
+function esc(str) { return escHtml(str); }
 
 // ─── LEAD SCORING ────────────────────────────────────────────────
 function scoreLead(lead) {
@@ -1217,15 +1217,7 @@ function scoreLead(lead) {
   else if (lead.businessAge >= 2)   score += 3;
   else if (lead.businessAge === 0)  score -= 5; // brand new, risky
 
-  // Business health signals
-  if (lead.reviewCount >= 50)       score += 10;
-  else if (lead.reviewCount >= 20)  score += 6;
-  else if (lead.reviewCount >= 5)   score += 3;
-
-  if (lead.rating >= 4.0)           score += 5;
-  else if (lead.rating >= 3.0)      score += 2;
-
-  if (lead.hasHours)                score += 5; // confirmed open/operating
+  // Business health signals removed (reviews/hours not needed for MCA)
 
   // SBA loan = revenue confirmed, but also has debt
   if (lead.sbaFound) {
@@ -1301,7 +1293,7 @@ function buildLinks(name, city, st) {
   const full = encodeURIComponent(`${name} ${city} ${st}`);
   const stl = (st||'').toLowerCase();
   return {
-    stateRegistry: buildRegistryUrl(st, b) || `https://www.google.com/search?q=${b}+${st}+secretary+state+business+search`,
+    stateRegistry: buildRegistryUrl(st, b) || `https://www.bing.com/search?q=${b}+${st}+secretary+of+state+business+search`,
     openCorporates: `https://opencorporates.com/companies?q=${b}&jurisdiction_code=us_${stl}&type=companies`,
     ownerGoogle: `https://www.google.com/search?q="${b}"+"${c}"+"owner"+OR+"president"+OR+"principal"`,
     truePeople: `https://www.truepeoplesearch.com/results?phoneno=PHONE_PLACEHOLDER`,
@@ -1336,7 +1328,7 @@ async function fetchLeads() {
 
   try {
     // Each industry runs all its search term variants + nearby suburbs in parallel
-    const perTerm = 40; // fewer concurrent searches, so each fetches more
+    const perTerm = 80; // each term fetches 80 so even single-term searches hit 75 after dedup
     // Single location per search — HERE returns up to 100 results per call, no need to spam suburbs
     const searches = state.selectedIndustries.flatMap(ind => {
       const termList = SEARCH_TERMS[ind] || [ind];
@@ -1416,9 +1408,9 @@ async function fetchLeads() {
             const lead = {...b, id: `lead-${i}-${Date.now()}`, city: bCity, state: bState,
               estimatedMonthlyRevenue: b.estimatedMonthlyRevenue || null, loanAmount: b.loanAmount || null, approvalDate: b.approvalDate || null, jobsSupported: b.jobsSupported || null,
               bizType: null, dataSource: 'RCN Database', verified: true, enriched: false,
-              reviewCount: b.reviewCount || 0, businessStatus: null, hasHours: null, score: null,
+              businessStatus: null, score: null,
               stackingRisk: null, businessAge: b.businessAge || null, incorporationDate: b.incorporationDate || null, officerName: b.officerName || null,
-              companyStatus: b.companyStatus || null, source: b.source || 'google', ...links};
+              companyStatus: b.companyStatus || null, source: b.source || 'here', ...links};
             lead.score = scoreLead(lead);
             return lead;
           })
@@ -1461,16 +1453,14 @@ async function fetchLeads() {
         dataSource: 'RCN Database',
         verified: true,
         enriched: false, // user must click enrich to get full details
-        reviewCount: b.reviewCount || 0,
-        businessStatus: null,
-        hasHours: null,
-        score: null,
+                businessStatus: null,
+          score: null,
         stackingRisk: null,
         businessAge: b.businessAge || null,
         incorporationDate: b.incorporationDate || null,
         officerName: b.officerName || null,
         companyStatus: b.companyStatus || null,
-        source: b.source || 'google',
+        source: b.source || 'here',
         ...links,
       };
       lead.score = scoreLead(lead);
@@ -1495,7 +1485,7 @@ async function fetchLeads() {
   }
 }
 
-async function enrichWithGoogle(leadId) {
+async function enrichLead(leadId) {
   const lead = state.leads.find(l => l.id === leadId);
   if (!lead || !lead.placeId) { console.warn('No placeId for lead', leadId); return; }
   setState({enriching: leadId});
@@ -1535,9 +1525,7 @@ async function enrichWithGoogle(leadId) {
       ownerPhone: data.ownerPhone || lead.ownerPhone || null,
       linkedIn: data.linkedIn || lead.linkedIn || null,
       sosUrl: data.sosUrl || lead.sosUrl || null,
-      reviewCount: data.reviewCount || lead.reviewCount || 0,
       businessStatus: data.businessStatus || null,
-      hasHours: data.hasHours || false,
       businessAge: data.businessAge || lead.businessAge || null,
       incorporationDate: data.incorporationDate || lead.incorporationDate || null,
       officerName: data.officerName || lead.officerName || null,
@@ -1574,7 +1562,7 @@ async function enrichWithGoogle(leadId) {
 
 async function enrichAll() {
   for (const lead of state.leads.filter(l => !l.enriched)) {
-    await enrichWithGoogle(lead.id);
+    await enrichLead(lead.id);
     await new Promise(r => setTimeout(r, 500));
   }
 }
@@ -1687,8 +1675,9 @@ function renderLeadCard(lead, isSaved) {
     <div style="padding:14px 16px">
       <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:8px">
         <div style="flex:1">
-          <div style="font-size:15px;font-weight:700;color:#fff;margin-bottom:6px;font-family:'IBM Plex Sans',sans-serif">
+          <div style="font-size:15px;font-weight:700;color:#fff;margin-bottom:6px;font-family:'IBM Plex Sans',sans-serif;display:flex;align-items:center;gap:8px;flex-wrap:wrap">
             ${escHtml(lead.businessName)}
+            ${(()=>{const sc=scoreColor(lead.score||0);return `<span style="font-size:9px;font-weight:700;letter-spacing:0.1em;padding:2px 7px;border-radius:3px;background:${sc.bg};color:${sc.color};border:1px solid ${sc.border}">${sc.label}</span>`;})()}
           </div>
           <div style="display:flex;gap:5px;flex-wrap:wrap">
             <span class="tag" style="background:${c.bg};color:${c.color};border:1px solid ${c.border}">${escHtml(lead.industry)}</span>
@@ -1709,14 +1698,15 @@ function renderLeadCard(lead, isSaved) {
           </div>
         </div>
         <div style="display:flex;gap:6px;margin-left:12px;flex-shrink:0">
-          ${!isSaved ? `<button onclick="enrichWithGoogle('${lead.id}')" title="${lead.enriched ? (lead.enrichGains||'Re-enrich') : 'Enrich: find phone, email, website'}" style="padding:6px 10px;background:${lead.enrichError ? '#1a0808' : lead.enriched ? '#0a1a0a' : '#0a1525'};color:${lead.enrichError ? '#ff4466' : lead.enriched ? '#33aa33' : '#4488ff'};border:1px solid ${lead.enrichError ? '#3a1020' : lead.enriched ? '#0a2a0a' : '#1a2a4a'};border-radius:6px;font-size:13px">${state.enriching === lead.id ? '<span class="spinner"></span>' : lead.enrichError ? '✗' : lead.enriched ? '✓' : '🔍'}</button>` : ''}
+          ${lead.phone ? `<a href="tel:${(lead.phone||'').replace(/\D/g,'')}" onclick="logCall('${lead.id}','${lead.phone||''}','${(lead.businessName||'').replace(/'/g,\"\\\'\").replace(/\`/g,'\'\'')}');event.stopPropagation()" style="display:inline-flex;align-items:center;gap:4px;padding:5px 10px;background:linear-gradient(135deg,#003811,#001a08);color:#00e87a;border:1px solid #00441a;border-radius:5px;font-size:11px;font-weight:700;font-family:'IBM Plex Mono',monospace;text-decoration:none;letter-spacing:0.05em" title="Click to call ${escHtml(lead.phone)}">📲 CALL</a>` : ''}
+          ${!isSaved ? `<button onclick="enrichLead('${lead.id}')" title="${lead.enriched ? (lead.enrichGains||'Re-enrich') : 'Enrich: find phone, email, website'}" style="padding:6px 10px;background:${lead.enrichError ? '#1a0808' : lead.enriched ? '#0a1a0a' : '#0a1525'};color:${lead.enrichError ? '#ff4466' : lead.enriched ? '#33aa33' : '#4488ff'};border:1px solid ${lead.enrichError ? '#3a1020' : lead.enriched ? '#0a2a0a' : '#1a2a4a'};border-radius:6px;font-size:13px">${state.enriching === lead.id ? '<span class="spinner"></span>' : lead.enrichError ? '✗' : lead.enriched ? '✓' : '🔍'}</button>` : ''}
           ${!isSaved ? (() => {
             const ph = (lead.phone||'').replace(/\D/g,'');
             const tpPhone = ph ? `https://www.truepeoplesearch.com/results?phoneno=${ph}` : null;
             const tpName = lead.officerName ? `https://www.truepeoplesearch.com/results?name=${encodeURIComponent(lead.officerName)}&citystatezip=${encodeURIComponent(lead.state||'')}` : null;
             const href = tpPhone || tpName || null;
             const tip = tpPhone ? 'Reverse lookup business phone — may be owner cell' : tpName ? `Search owner by name: ${esc(lead.officerName)}` : 'Enrich first to get phone or officer name';
-            if (!href) return `<button onclick="enrichWithGoogle('${lead.id}')" title="${tip}" style="padding:6px 10px;background:#0a0f1a;color:#4a5a7a;border:1px solid #1a1a2a;border-radius:6px;font-size:13px">👤</button>`;
+            if (!href) return `<button onclick="enrichLead('${lead.id}')" title="${tip}" style="padding:6px 10px;background:#0a0f1a;color:#4a5a7a;border:1px solid #1a1a2a;border-radius:6px;font-size:13px">👤</button>`;
             return `<a href="${href}" target="_blank" title="${tip}" style="padding:6px 10px;background:#0a1020;color:#4488ff;border:1px solid #1a2a4a;border-radius:6px;font-size:13px;text-decoration:none;display:inline-flex;align-items:center">👤</a>`;
           })() : ''}
           ${!isSaved && lead.sbaFound === undefined ? `<button onclick="${state.sbaReady ? "checkSBA('" + lead.id + "')" : ''}" title="${state.sbaReady ? 'Check SBA loan history' : 'SBA database loading — please wait...'}" style="padding:6px 10px;background:${state.sbaReady ? '#0a0a25' : '#0a0a18'};color:${state.sbaReady ? '#8866ff' : '#4a4a7a'};border:1px solid ${state.sbaReady ? '#1a1a4a' : '#141428'};border-radius:6px;font-size:11px;font-family:'IBM Plex Mono',monospace;font-weight:700;cursor:${state.sbaReady ? 'pointer' : 'not-allowed'}">${lead.sbaChecking ? '<span class="spinner"></span>' : state.sbaReady ? '📊 SBA' : '⏳ SBA'}</button>` : ''}
@@ -1737,7 +1727,12 @@ function renderLeadCard(lead, isSaved) {
       </div>` : ''}
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:5px 16px;font-size:11px">
         <div style="grid-column:1/-1"><span style="color:#3a3a6a">📍 </span><span style="color:#8888bb">${escHtml(lead.address || `${lead.city}, ${lead.state}`)}</span></div>
-        ${esc(lead.phone) ? `<div><span style="color:#3a3a6a">📞 </span><span style="color:#aabbff;font-weight:600">${escHtml(lead.phone)}</span></div>` : ''}
+        ${esc(lead.phone) ? `<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+          <span style="color:#3a3a6a">📞</span>
+          <a href="tel:${lead.phone.replace(/\D/g,'')}" onclick="logCall('${lead.id}','${escHtml(lead.phone)}','${escHtml(lead.businessName||'')}');event.stopPropagation()" style="color:#aabbff;font-weight:700;text-decoration:none" title="Click to call">${escHtml(lead.phone)}</a>
+          <button onclick="openDialer(${JSON.stringify({id:lead.id,businessName:lead.businessName,phone:lead.phone,ownerPhone:lead.ownerPhone||'',city:lead.city||'',state:lead.state||''}).replace(/\`/g,\"\'\")});event.stopPropagation()" style="padding:2px 8px;background:#0d1a2e;color:#4488ff;border:1px solid #1a3a5a;border-radius:3px;font-size:9px;font-family:'IBM Plex Mono',monospace;font-weight:700;cursor:pointer">⬆ DIALER</button>
+          ${lead.called ? `<span style="font-size:9px;color:#00884a;background:#021209;border:1px solid #00441a;padding:1px 6px;border-radius:3px;font-weight:700">✓ CALLED</span>` : ''}
+        </div>` : ''}
         ${esc(lead.website) ? `<div style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap"><span style="color:#3a3a6a">🌐 </span><a href="${safeUrl(lead.website)}" target="_blank" style="color:#4488ff">${escHtml((lead.website||'').replace(/^https?:\/\/(www\.)?/,'').split('/')[0])}</a></div>` : ''}
         ${lead.email && lead.email !== lead.ownerEmail ? `<div><span style="color:#3a3a6a">✉️ </span><a href="mailto:${lead.email}" style="color:#44aaff">${escHtml(lead.email)}</a><span style="color:#2a2a4a;font-size:9px"> ${lead.emailSource === 'hunter' ? '(hunter)' : lead.emailSource === 'html-scrape' ? '(scraped)' : ''}</span></div>` : ''}
         ${lead.jobsSupported > 0 ? `<div><span style="color:#3a3a6a">👥 </span><span style="color:#6a6a9a">~${lead.jobsSupported} employees</span></div>` : ''}
@@ -1909,7 +1904,7 @@ function renderAuth() {
   }, 50);
 }
 
-async function handleAuth() {
+async async function handleAuth() {
   const email = document.getElementById('auth-email')?.value?.trim();
   const password = document.getElementById('auth-password')?.value;
   if (!email || !password) { setState({authError: 'Please enter your email and password'}); return; }
@@ -1957,7 +1952,7 @@ function render() {
       ${currentUser ? `
       <div style="border-left:1px solid #1a1a35;padding-left:24px;text-align:right">
         <div style="font-size:10px;color:#fff;font-weight:700;margin-bottom:3px">${(currentUser.name || currentUser.email).toUpperCase()}</div>
-        <div style="font-size:9px;color:#3a3a6a">${currentUser.plan.toUpperCase()} · ${currentUser.searches_remaining === null ? '∞' : currentUser.searches_remaining} LEFT</div>
+        <div style="font-size:9px;color:#3a3a6a">UNLIMITED</div>
         <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:3px">
           <span style="font-size:9px;color:#6655bb;cursor:pointer" onclick="setState({activeTab:'profile'});loadProfile()">PROFILE</span>
           <span style="font-size:9px;color:#3366ff;cursor:pointer" onclick="logout()">SIGN OUT</span>
@@ -1971,12 +1966,14 @@ function render() {
     <button class="tab ${state.activeTab==='generate'?'on':''}" onclick="setState({activeTab:'generate'})">⚡ FIND LEADS</button>
     <button class="tab ${state.activeTab==='saved'?'on':''}" onclick="setState({activeTab:'saved'})">💾 SAVED (${state.savedLeads.length})</button>
     <button class="tab ${state.activeTab==='history'?'on':''}" onclick="setState({activeTab:'history'})">🕐 HISTORY (${state.searchHistory.length})</button>
+        <button class="tab ${state.activeTab==='calllog'?'on':''}" onclick="setState({activeTab:'calllog'})">📞 CALL LOG${state.callLog.length ? ` (${state.callLog.length})` : ''}</button>
     <button class="tab ${state.activeTab==='profile'?'on':''}" onclick="setState({activeTab:'profile'});loadProfile()">👤 PROFILE</button>
     ${currentUser?.is_admin ? `<a href="/admin.html" style="margin-left:auto;padding:6px 14px;background:#1a0a2a;color:#aa66ff;border:1px solid #2a1a4a;border-radius:6px;font-size:10px;font-family:'IBM Plex Mono',monospace;font-weight:700;text-decoration:none;display:flex;align-items:center">🔐 ADMIN</a>` : ''}
   </div>
 
   <div style="padding:22px 28px;max-width:1400px;margin:0 auto">
     ${renderTabContent(filtered)}
+  ${renderDialerModal()}
   </div>`;
 }
 
@@ -1999,10 +1996,9 @@ function renderTabContent(filtered) {
           <label style="display:block;font-size:10px;color:#6a6a9a;margin-bottom:5px">CITY</label>
           <input placeholder="e.g. Miami, Atlanta..." value="${escHtml(state.selectedCity)}" oninput="state.selectedCity=this.value" style="margin-bottom:14px" />
 
-          <label style="display:block;font-size:10px;color:#6a6a9a;margin-bottom:5px">LEADS TO FIND</label>
-          <select onchange="state.maxLeads=Number(this.value)" style="margin-bottom:18px">
-            ${[10,25,35,50,75,100].map(n => `<option value="${n}" ${state.maxLeads===n?'selected':''}>${n} leads</option>`).join('')}
-          </select>
+          <div style="font-size:10px;color:#3a3a6a;letter-spacing:0.08em;margin-bottom:18px;padding:8px 10px;background:#080818;border:1px solid #1a1a35;border-radius:5px">
+            🎯 <span style="color:#6a6a9a">RETURNING</span> <span style="color:#aabbff;font-weight:700">75 LEADS</span> <span style="color:#3a3a6a">per search</span>
+          </div>
 
           <div onclick="setState({sbaOnly:!state.sbaOnly})" style="display:flex;align-items:center;gap:10px;cursor:pointer;padding:10px 12px;background:${state.sbaOnly?'#08082a':'#0a0a14'};border:1px solid ${state.sbaOnly?'#2244aa':'#1a1a2a'};border-radius:6px;margin-bottom:14px;user-select:none">
             <div style="width:28px;height:16px;border-radius:8px;background:${state.sbaOnly?'#2244ff':'#1a1a2a'};border:1px solid ${state.sbaOnly?'#4466ff':'#2a2a4a'};position:relative;flex-shrink:0">
@@ -2112,6 +2108,49 @@ function renderTabContent(filtered) {
       ${state.savedLeads.map(lead => renderLeadCard(lead, true)).join('')}
     </div>`; }
   if (state.activeTab === 'profile') { return renderProfile(); }
+  if (state.activeTab === 'calllog') { return `
+    <div>
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px">
+        <div>
+          <span style="font-size:12px;color:#4a4a7a">${state.callLog.length} calls logged</span>
+          ${state.callLog.filter(c=>c.outcome==='answered').length ? `<span style="font-size:10px;color:#00cc44;margin-left:12px">✅ ${state.callLog.filter(c=>c.outcome==='answered').length} answered</span>` : ''}
+          ${state.callLog.filter(c=>c.outcome==='callback').length ? `<span style="font-size:10px;color:#4488ff;margin-left:10px">🔁 ${state.callLog.filter(c=>c.outcome==='callback').length} callbacks</span>` : ''}
+        </div>
+        ${state.callLog.length > 0 ? `<button onclick="clearCallLog()" style="padding:6px 14px;background:#1a0a0a;color:#ff4466;border:1px solid #3a1020;border-radius:6px;font-size:10px;font-family:'IBM Plex Mono',monospace">🗑 CLEAR</button>` : ''}
+      </div>
+      ${state.callLog.length === 0 ? `
+      <div style="text-align:center;padding:80px;color:#1a1a3a;border:1px dashed #1a1a32;border-radius:12px">
+        <div style="font-size:40px;margin-bottom:12px">📞</div>
+        <div style="font-size:12px;letter-spacing:0.12em;color:#2a2a4a">NO CALLS LOGGED YET</div>
+        <div style="font-size:10px;color:#1a1a3a;margin-top:8px">Click any phone number or the DIALER button to start calling</div>
+      </div>` : ''}
+      ${state.callLog.map(c => {
+        const outcomeColors = {answered:'#00cc44',voicemail:'#ffaa00','no-answer':'#ff4444',callback:'#4488ff',dialed:'#4a4a7a'};
+        const outcomeLabels = {answered:'✅ ANSWERED',voicemail:'📬 VOICEMAIL','no-answer':'🚫 NO ANSWER',callback:'🔁 CALLBACK',dialed:'📲 DIALED'};
+        const col = outcomeColors[c.outcome] || '#4a4a7a';
+        const d = new Date(c.ts);
+        return `<div style="background:#0c0c1c;border:1px solid #1a1a32;border-radius:8px;margin-bottom:8px;padding:14px 16px">
+          <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:6px">
+            <div>
+              <div style="font-size:13px;font-weight:700;color:#fff;margin-bottom:3px">${escHtml(c.bizName||'Unknown Business')}</div>
+              <div style="font-size:12px;color:#aabbff;font-family:'IBM Plex Mono',monospace">${escHtml(c.phone)}</div>
+            </div>
+            <div style="text-align:right">
+              <div style="font-size:9px;font-weight:700;padding:3px 8px;border-radius:3px;background:#0a0a1a;color:${col};border:1px solid ${col}40;margin-bottom:4px">${outcomeLabels[c.outcome]||c.outcome?.toUpperCase()}</div>
+              <div style="font-size:9px;color:#3a3a6a">${d.toLocaleDateString()} ${d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}</div>
+            </div>
+          </div>
+          ${c.note ? `<div style="font-size:11px;color:#6a6a9a;padding:6px 10px;background:#080818;border-radius:4px;border-left:2px solid #2a2a5a;font-style:italic">${escHtml(c.note)}</div>` : ''}
+          <div style="display:flex;gap:5px;margin-top:10px;flex-wrap:wrap">
+            ${['answered','voicemail','no-answer','callback'].map(o => {
+              const labels2={answered:'✅ Answered',voicemail:'📬 Voicemail','no-answer':'🚫 No Answer',callback:'🔁 Callback'};
+              const isActive = c.outcome === o;
+              return `<button onclick="updateCallOutcome(${c.id},'${o}')" style="padding:3px 8px;background:${isActive?'#0a1a0a':'#0a0a1a'};color:${isActive?outcomeColors[o]:'#4a4a7a'};border:1px solid ${isActive?outcomeColors[o]:'#2a2a4a'};border-radius:3px;font-size:9px;font-family:'IBM Plex Mono',monospace;cursor:pointer">${labels2[o]}</button>`;
+            }).join('')}
+          </div>
+        </div>`;
+      }).join('')}
+    </div>`; }
   return `
     <div>
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px">
@@ -2165,7 +2204,7 @@ function renderTabContent(filtered) {
 
 function renderProfile() {
   const u = currentUser || {};
-  const planPrices = { pro: 499, agency: 899, unlimited: 2299 };
+  const planPrices = { unlimited: 2299 };
   const planPrice = planPrices[u.plan] || 0;
   const stripeNet = (planPrice * 0.971 - 0.30).toFixed(2);
   const planStart = u.plan_start_date ? new Date(u.plan_start_date) : null;
@@ -2215,7 +2254,7 @@ function renderProfile() {
       <div style="padding:4px 0">
         <div style="padding:12px 20px;display:flex;justify-content:space-between;border-bottom:1px solid #0f0f22">
           <div style="font-size:9px;color:#4a4a7a">CURRENT PLAN</div>
-          <div style="font-size:12px;font-weight:700;color:${u.plan==='unlimited'?'#aa66ff':u.plan==='agency'?'#4488ff':'#00cc66'};letter-spacing:0.1em">${u.plan ? u.plan.toUpperCase() : '—'}</div>
+          <div style="font-size:12px;font-weight:700;color:${'#aa66ff'};letter-spacing:0.1em">${u.plan ? u.plan.toUpperCase() : '—'}</div>
         </div>
         <div style="padding:12px 20px;display:flex;justify-content:space-between;border-bottom:1px solid #0f0f22">
           <div style="font-size:9px;color:#4a4a7a">MONTHLY RATE</div>
@@ -2388,6 +2427,159 @@ function rerunSearch(entryId) {
   });
   // Small delay so state renders first, then auto-run
   setTimeout(() => fetchLeads(), 100);
+}
+
+// ─── DIALER & CALL LOGGING ──────────────────────────────────────
+
+function logCall(leadId, phone, bizName) {
+  const entry = {
+    id: Date.now(),
+    leadId,
+    phone,
+    bizName,
+    ts: new Date().toISOString(),
+    note: '',
+    outcome: 'dialed', // dialed | answered | voicemail | no-answer | callback
+  };
+  const updated = [entry, ...state.callLog].slice(0, 500); // keep last 500
+  localStorage.setItem('rcn_callLog', JSON.stringify(updated));
+  setState({ callLog: updated });
+
+  // Mark lead as called
+  const leads = state.leads.map(l => l.id === leadId ? {...l, called: true, lastCalled: entry.ts} : l);
+  const saved = state.savedLeads.map(l => l.id === leadId ? {...l, called: true, lastCalled: entry.ts} : l);
+  localStorage.setItem('savedLeads', JSON.stringify(saved));
+  setState({ leads, savedLeads: saved });
+}
+
+function updateCallOutcome(callId, outcome) {
+  const updated = state.callLog.map(c => c.id === callId ? {...c, outcome} : c);
+  localStorage.setItem('rcn_callLog', JSON.stringify(updated));
+  setState({ callLog: updated });
+}
+
+function updateCallNote(callId, note) {
+  const updated = state.callLog.map(c => c.id === callId ? {...c, note} : c);
+  localStorage.setItem('rcn_callLog', JSON.stringify(updated));
+  setState({ callLog: updated });
+}
+
+function clearCallLog() {
+  if (!confirm('Clear all call history? This cannot be undone.')) return;
+  localStorage.setItem('rcn_callLog', '[]');
+  setState({ callLog: [] });
+}
+
+function openDialer(lead) {
+  setState({ dialerOpen: true, dialerLead: lead });
+}
+
+function closeDialer() {
+  if (state.callTimerInterval) { clearInterval(state.callTimerInterval); }
+  setState({ dialerOpen: false, dialerLead: null, callTimer: 0, callTimerInterval: null });
+}
+
+function startCallTimer(leadId, phone, bizName) {
+  logCall(leadId, phone, bizName);
+  const interval = setInterval(() => setState({ callTimer: state.callTimer + 1 }), 1000);
+  setState({ callTimer: 0, callTimerInterval: interval });
+}
+
+function formatTimer(secs) {
+  const m = Math.floor(secs/60).toString().padStart(2,'0');
+  const s = (secs%60).toString().padStart(2,'0');
+  return m + ':' + s;
+}
+
+function renderDialerModal() {
+  if (!state.dialerOpen || !state.dialerLead) return '';
+  const lead = state.dialerLead;
+  const phone = (lead.phone||'').replace(/\D/g,'');
+  const ownerPhone = (lead.ownerPhone||'').replace(/\D/g,'');
+  const recentCalls = state.callLog.filter(c => c.leadId === lead.id).slice(0,3);
+
+  return `
+  <div onclick="closeDialer()" style="position:fixed;inset:0;background:rgba(0,0,0,0.75);z-index:1000;display:flex;align-items:center;justify-content:center;padding:20px">
+    <div onclick="event.stopPropagation()" style="background:#0a0a1e;border:1px solid #2a2a4a;border-radius:14px;width:100%;max-width:420px;padding:28px;position:relative">
+
+      <!-- Header -->
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:20px">
+        <div>
+          <div style="font-size:11px;color:#4a4a7a;letter-spacing:0.12em;font-family:'IBM Plex Mono',monospace;margin-bottom:4px">DIALER</div>
+          <div style="font-size:16px;font-weight:700;color:#fff">${escHtml(lead.businessName)}</div>
+          <div style="font-size:11px;color:#5a5a8a;margin-top:3px">${escHtml(lead.city||'')}${lead.city&&lead.state?', ':''}${escHtml(lead.state||'')}</div>
+        </div>
+        <button onclick="closeDialer()" style="background:none;border:none;color:#4a4a7a;font-size:20px;cursor:pointer;padding:4px;line-height:1">✕</button>
+      </div>
+
+      <!-- Call Timer -->
+      ${state.callTimerInterval ? `
+      <div style="text-align:center;padding:16px;background:#041a0e;border:1px solid #00441a;border-radius:8px;margin-bottom:16px">
+        <div style="font-size:32px;font-family:'IBM Plex Mono',monospace;font-weight:700;color:#00e87a;letter-spacing:0.1em">${formatTimer(state.callTimer)}</div>
+        <div style="font-size:10px;color:#00883a;letter-spacing:0.1em;margin-top:4px">● CALL IN PROGRESS</div>
+      </div>` : ''}
+
+      <!-- Phone Numbers -->
+      <div style="margin-bottom:16px">
+        <div style="font-size:10px;color:#4a4a7a;letter-spacing:0.1em;margin-bottom:8px;font-family:'IBM Plex Mono',monospace">PHONE NUMBERS</div>
+        ${phone ? `
+        <a href="tel:${phone}" onclick="startCallTimer('${lead.id}','${escHtml(lead.phone||'')}','${escHtml(lead.businessName||'')}');event.preventDefault();window.location.href='tel:${phone}'" 
+           style="display:flex;align-items:center;justify-content:space-between;padding:12px 16px;background:#0d1a2e;border:1px solid #1a3a5a;border-radius:8px;text-decoration:none;margin-bottom:8px;cursor:pointer">
+          <div>
+            <div style="font-size:10px;color:#4488ff;letter-spacing:0.1em;font-family:'IBM Plex Mono',monospace;margin-bottom:3px">BUSINESS</div>
+            <div style="font-size:16px;font-weight:700;color:#fff;font-family:'IBM Plex Mono',monospace">${escHtml(lead.phone)}</div>
+          </div>
+          <div style="padding:8px 16px;background:linear-gradient(135deg,#1a44ff,#0022cc);color:#fff;border-radius:6px;font-size:11px;font-weight:700;font-family:'IBM Plex Mono',monospace">📲 CALL</div>
+        </a>` : '<div style="padding:10px;color:#3a3a6a;font-size:12px;font-style:italic">No business phone — click Enrich to find one</div>'}
+
+        ${ownerPhone ? `
+        <a href="tel:${ownerPhone}" onclick="startCallTimer('${lead.id}','${escHtml(lead.ownerPhone||'')}','${escHtml(lead.businessName||'')}');event.preventDefault();window.location.href='tel:${ownerPhone}'"
+           style="display:flex;align-items:center;justify-content:space-between;padding:12px 16px;background:#0d1a0d;border:1px solid #1a3a1a;border-radius:8px;text-decoration:none;cursor:pointer">
+          <div>
+            <div style="font-size:10px;color:#00e87a;letter-spacing:0.1em;font-family:'IBM Plex Mono',monospace;margin-bottom:3px">OWNER CELL</div>
+            <div style="font-size:16px;font-weight:700;color:#fff;font-family:'IBM Plex Mono',monospace">${escHtml(lead.ownerPhone)}</div>
+          </div>
+          <div style="padding:8px 16px;background:linear-gradient(135deg,#003811,#001a08);color:#00e87a;border:1px solid #00441a;border-radius:6px;font-size:11px;font-weight:700;font-family:'IBM Plex Mono',monospace">📲 CALL</div>
+        </a>` : ''}
+      </div>
+
+      <!-- Outcome Buttons -->
+      ${recentCalls.length > 0 ? `
+      <div style="margin-bottom:16px">
+        <div style="font-size:10px;color:#4a4a7a;letter-spacing:0.1em;margin-bottom:8px;font-family:'IBM Plex Mono',monospace">LAST CALL OUTCOME</div>
+        <div style="display:flex;gap:6px;flex-wrap:wrap">
+          ${['answered','voicemail','no-answer','callback'].map(o => {
+            const labels = {answered:'✅ Answered',voicemail:'📬 Voicemail','no-answer':'🚫 No Answer',callback:'🔁 Callback'};
+            const colors = {answered:'#004400,#00cc44',voicemail:'#1a1000,#ffaa00','no-answer':'#1a0000,#ff4444',callback:'#00001a,#4488ff'};
+            const [bg, col] = colors[o].split(',');
+            const isActive = recentCalls[0]?.outcome === o;
+            return `<button onclick="updateCallOutcome(${recentCalls[0]?.id},'${o}')" style="padding:5px 10px;background:${isActive ? bg : '#0a0a1a'};color:${isActive ? col : '#4a4a7a'};border:1px solid ${isActive ? col : '#2a2a4a'};border-radius:4px;font-size:10px;font-family:'IBM Plex Mono',monospace;font-weight:700;cursor:pointer">${labels[o]}</button>`;
+          }).join('')}
+        </div>
+      </div>` : ''}
+
+      <!-- Quick Note -->
+      <div>
+        <div style="font-size:10px;color:#4a4a7a;letter-spacing:0.1em;margin-bottom:6px;font-family:'IBM Plex Mono',monospace">CALL NOTE</div>
+        <textarea oninput="if(state.callLog[0]?.leadId==='${lead.id}')updateCallNote(state.callLog[0].id,this.value)"
+          placeholder="Who answered? What did they say? Next steps..."
+          style="width:100%;height:70px;background:#0a0a1e;border:1px solid #1a1a35;border-radius:6px;color:#d8daf0;font-size:12px;font-family:'IBM Plex Mono',monospace;padding:10px;resize:none;outline:none">${recentCalls[0]?.note||''}</textarea>
+      </div>
+
+      <!-- Recent Calls -->
+      ${recentCalls.length > 0 ? `
+      <div style="margin-top:14px;border-top:1px solid #1a1a35;padding-top:14px">
+        <div style="font-size:10px;color:#4a4a7a;letter-spacing:0.1em;margin-bottom:8px;font-family:'IBM Plex Mono',monospace">RECENT CALLS</div>
+        ${recentCalls.map(c => `
+        <div style="display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid #0f0f20">
+          <div style="font-size:11px;color:#5a5a8a">${new Date(c.ts).toLocaleDateString()} ${new Date(c.ts).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})}</div>
+          <div style="font-size:10px;color:#4a4a7a">${c.phone}</div>
+          <div style="font-size:9px;font-weight:700;padding:2px 6px;border-radius:3px;background:#0a0a1a;color:${c.outcome==='answered'?'#00cc44':c.outcome==='callback'?'#4488ff':c.outcome==='voicemail'?'#ffaa00':'#ff4444'}">${c.outcome?.toUpperCase()}</div>
+        </div>`).join('')}
+      </div>` : ''}
+
+    </div>
+  </div>`;
 }
 
 // Initial render
