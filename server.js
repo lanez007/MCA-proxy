@@ -171,27 +171,45 @@ async function loadSBAData() {
         let idx = {};
         let leftover = "";
 
+        let firstChunkLogged = false;
         res.on("data", chunk => {
           const text = leftover + chunk.toString();
+          if (!firstChunkLogged) {
+            firstChunkLogged = true;
+            console.log("[SBA] First 200 chars of response:", text.substring(0,200).replace(/\n/g,' '));
+          }
           const lines = text.split("\n");
           leftover = lines.pop();
           for (const line of lines) {
             if (!line.trim()) continue;
             if (!headerParsed) {
+              // Detect HTML response (means URL returned error page, not CSV)
+              if (line.trim().startsWith('<') || line.trim().startsWith('<!')) {
+                reject(new Error("SBA URL returned HTML instead of CSV — URL may have changed"));
+                return;
+              }
               const headers = parseCSVLine(line).map(h => h.replace(/"/g, "").trim());
               idx = {
-                name:   headers.findIndex(h => /BorrowerName/i.test(h)),
-                city:   headers.findIndex(h => /BorrowerCity/i.test(h)),
-                state:  headers.findIndex(h => /BorrowerState/i.test(h)),
-                naics:  headers.findIndex(h => /NaicsCode/i.test(h)),
-                amount: headers.findIndex(h => /GrossApproval/i.test(h)),
-                date:   headers.findIndex(h => /ApprovalDate/i.test(h)),
-                lender: headers.findIndex(h => /BankName/i.test(h)),
-                jobs:   headers.findIndex(h => /JobsSupported/i.test(h)),
+                // Broad patterns to handle SBA column renames across dataset versions
+                name:   headers.findIndex(h => /Borr(ower)?Name|Business.?Name/i.test(h)),
+                city:   headers.findIndex(h => /Borr(ower)?City/i.test(h)),
+                state:  headers.findIndex(h => /Borr(ower)?State/i.test(h)),
+                naics:  headers.findIndex(h => /Naics/i.test(h)),
+                amount: headers.findIndex(h => /GrossApproval|SBAGuaranteed|GrossApproved|InitialApproval/i.test(h)),
+                date:   headers.findIndex(h => /ApprovalDate|Approval.?Date/i.test(h)),
+                lender: headers.findIndex(h => /BankName|Bank.?Name|LenderName/i.test(h)),
+                jobs:   headers.findIndex(h => /Jobs.?Supported|Jobs.?Retained/i.test(h)),
               };
               headerParsed = true;
-              if (idx.name < 0) { reject(new Error("CSV header parse failed — name col not found")); return; }
-              console.log(`📊 SBA CSV headers parsed. Columns: name=${idx.name} state=${idx.state} amount=${idx.amount} naics=${idx.naics}`);
+              // Log all headers so we can debug future column renames
+              console.log(`[SBA] CSV headers (${headers.length} cols):`, headers.slice(0,15).join(' | '));
+              console.log(`[SBA] Mapped: name=${idx.name}(${headers[idx.name]||'?'}) state=${idx.state}(${headers[idx.state]||'?'}) amount=${idx.amount}(${headers[idx.amount]||'?'})`);
+              if (idx.name < 0) {
+                // Log actual headers to help diagnose future renames
+                console.error('[SBA] name col not found. All headers:', headers.join(', '));
+                reject(new Error("CSV header parse failed — name col not found. Headers: " + headers.slice(0,10).join(', ')));
+                return;
+              }
               continue;
             }
             const cols = parseCSVLine(line);
